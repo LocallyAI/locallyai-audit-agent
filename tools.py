@@ -15,8 +15,10 @@ sitting 2 once we know what the agent actually needs.
 from __future__ import annotations
 
 import gzip
+import hmac as _hmac
 import json
 import os
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -196,8 +198,228 @@ LOG_SEARCH_SCHEMA = {
 }
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# hmac_verify — HMAC-chain integrity verification (sitting 2)
+# ─────────────────────────────────────────────────────────────────────────
+#
+# Re-implements LocallyAI's _chain_hmac algorithm (api.py:556-559) here
+# rather than importing api.py. The algorithm is 3 lines; vendoring it
+# keeps this codebase importable on machines that don't have LocallyAI
+# installed at all (the eventual deployment target for the agent).
+#
+# Canonical algorithm (matches api.py:2210-2223 verifier exactly):
+#
+#     prev = "0" * 64                                  # genesis
+#     for line in chronological order across rotations + live log:
+#         entry = json.loads(line)
+#         stored = entry.pop("_chain_hmac", "")
+#         if not stored: continue          # entries with no chain → skip
+#         msg = prev + json.dumps(entry, sort_keys=True)
+#         expected = HMAC-SHA256(key=AUDIT_HMAC_KEY, msg=msg).hex()
+#         if not compare_digest(stored, expected): TAMPERED
+#         prev = stored
+#
+# Notes for future-me:
+#   - `entry.pop("_chain_hmac")` MUST run before json.dumps, since the
+#     HMAC was computed over the dict before _chain_hmac was added.
+#   - `sort_keys=True`, NO separators argument (default `(', ', ': ')`).
+#   - `_AUDIT_HMAC_KEY` is whatever bytes the env var holds — NOT hex-
+#     decoded (api.py does `.encode()` only, treating the hex string as
+#     ASCII bytes). Verifier must match exactly.
+
+_HMAC_KEY_ENV = "LOCALLYAI_AUDIT_HMAC_KEY"
+_GENESIS_PREV = "0" * 64
+
+
+class HmacKeyMissing(RuntimeError):
+    """Raised when the HMAC key isn't configured. Surfaces clearly to
+    the caller instead of silently returning chain_intact=False."""
+
+
+def _load_hmac_key() -> bytes:
+    """Read the HMAC key from env (matches LocallyAI's convention)."""
+    raw = os.environ.get(_HMAC_KEY_ENV, "").strip()
+    if not raw:
+        raise HmacKeyMissing(
+            f"{_HMAC_KEY_ENV} not set in environment. Source LocallyAI's "
+            f".env (e.g. `set -a; . /path/to/locallyai/.env; set +a`) "
+            f"before running the agent. The secret is never accepted as "
+            f"a tool argument."
+        )
+    return raw.encode("utf-8")
+
+
+def _expected_chain_hmac(entry_without_field: dict, prev: str, key: bytes) -> str:
+    """Vendored from LocallyAI api.py:_chain_hmac. Returns hex digest."""
+    entry_json = json.dumps(entry_without_field, sort_keys=True)
+    return _hmac.new(key, f"{prev}{entry_json}".encode("utf-8"), sha256).hexdigest()
+
+
+def _iter_log_entries_with_seq(active: Path) -> Iterable[tuple[int, dict[str, Any]]]:
+    """Yield (seq, entry) across rotations + active log in chronological
+    order. seq is 1-indexed across the full chain.
+
+    Walk order matches LocallyAI's audit_verify endpoint (api.py:2236-2248):
+    `sorted(LOG_DIR.glob("audit-*.log.gz"))` first, then the active log.
+    """
+    if not active.parent.exists():
+        return
+    archives = sorted(active.parent.glob(f"{active.stem}-*.log.gz"))
+    seq = 0
+    for f in archives + ([active] if active.exists() else []):
+        for entry in _iter_entries_from(f):
+            seq += 1
+            yield seq, entry
+
+
+def hmac_verify(start_seq: int | None = None, end_seq: int | None = None) -> dict[str, Any]:
+    """Verify the LocallyAI audit-log HMAC chain.
+
+    Args:
+        start_seq: 1-indexed first entry to record results for. None = 1.
+        end_seq: 1-indexed last entry to record results for. None = the
+            last entry on disk.
+
+    Returns the shape the agent-side cli + system prompt expect:
+        {
+          "verified_count": int,            # entries that hashed correctly in range
+          "total_count":    int,            # entries inspected in range
+          "first_failure_seq": int | None,  # earliest break in range, if any
+          "failures": [                     # truncated to first 10
+            {"seq", "expected_hmac", "stored_hmac", "timestamp"}, ...
+          ],
+          "chain_intact":   bool,           # True iff failures == [] in range
+        }
+
+    Important: chain-of-trust extends from genesis. To verify entry N
+    correctly, we MUST recompute entries 1..N-1 (their `_chain_hmac`
+    becomes the `prev` for entry N). Narrowing via start_seq does not
+    skip that walk — it only narrows the failure-reporting window. This
+    is a correctness > performance choice; at 50K+ entries we'd add an
+    explicit `unsafe_skip_to_start` opt-in.
+    """
+    # Bounds + normalisation. None-and-zero both mean "no constraint".
+    lo = max(1, int(start_seq)) if start_seq else 1
+    hi = int(end_seq) if end_seq else None
+    if hi is not None and hi < lo:
+        return {
+            "verified_count": 0, "total_count": 0,
+            "first_failure_seq": None, "failures": [],
+            "chain_intact": True,
+            "error": f"end_seq ({hi}) < start_seq ({lo})",
+        }
+
+    key = _load_hmac_key()           # raises HmacKeyMissing if unset
+    active = _resolve_log_path()
+
+    prev = _GENESIS_PREV
+    verified_count = 0
+    total_count = 0
+    first_failure_seq: int | None = None
+    failures: list[dict[str, Any]] = []
+    _FAILURE_CAP = 10
+
+    for seq, entry in _iter_log_entries_with_seq(active):
+        if hi is not None and seq > hi:
+            break
+        # Mutate-on-copy: don't disturb the iterator's view of the entry.
+        e = dict(entry)
+        stored = e.pop("_chain_hmac", "")
+        if not stored:
+            # Entries without _chain_hmac happen when LOCALLYAI_AUDIT_HMAC_KEY
+            # was empty at write time. The canonical verifier skips them
+            # without advancing `prev` either — preserve that semantics.
+            continue
+
+        in_range = seq >= lo
+        expected = _expected_chain_hmac(e, prev, key)
+
+        if in_range:
+            total_count += 1
+        match = _hmac.compare_digest(stored, expected)
+        if match:
+            if in_range:
+                verified_count += 1
+        else:
+            if in_range:
+                if first_failure_seq is None:
+                    first_failure_seq = seq
+                if len(failures) < _FAILURE_CAP:
+                    failures.append({
+                        "seq": seq,
+                        "expected_hmac": expected,
+                        "stored_hmac": stored,
+                        "timestamp": entry.get("timestamp", ""),
+                    })
+        # Advance prev with what's STORED on disk, not with `expected`.
+        # Otherwise a single tampered entry only breaks that one seq;
+        # the canonical chain semantics is "everything after the break
+        # also fails", which only happens when prev follows the stored
+        # value (so the next entry's recomputation diverges).
+        prev = stored
+
+    return {
+        "verified_count": verified_count,
+        "total_count": total_count,
+        "first_failure_seq": first_failure_seq,
+        "failures": failures,
+        "chain_intact": first_failure_seq is None,
+    }
+
+
+HMAC_VERIFY_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "hmac_verify",
+        "description": (
+            "Verify the cryptographic integrity of LocallyAI's audit log "
+            "by recomputing the HMAC-SHA256 chain and comparing against "
+            "the stored `_chain_hmac` per entry. USE THIS TOOL for any "
+            "question about: tampering, chain integrity, log validity, "
+            "whether the log has been modified, whether entries N-M are "
+            "intact, or whether you can trust the audit trail. "
+            "Returns `chain_intact: true` if every entry's recomputed "
+            "HMAC matches the stored value, or `chain_intact: false` "
+            "with `first_failure_seq` pointing at the earliest break. "
+            "Always cite `first_failure_seq` and the timestamp of the "
+            "first failed entry in your answer when chain_intact is "
+            "false. Pass start_seq + end_seq to narrow the result "
+            "window (the walk still starts from genesis to preserve "
+            "chain-of-trust). Do NOT use this tool to find log content; "
+            "use `log_search` for that."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "start_seq": {
+                    "type": "integer",
+                    "description": (
+                        "1-indexed sequence number of the first entry to "
+                        "record results for. Omit or pass 1 to verify "
+                        "from the start of the chain."
+                    ),
+                    "minimum": 1,
+                },
+                "end_seq": {
+                    "type": "integer",
+                    "description": (
+                        "1-indexed sequence number of the last entry to "
+                        "record results for. Omit to verify to the end "
+                        "of the chain."
+                    ),
+                    "minimum": 1,
+                },
+            },
+            # Both optional — the model can call hmac_verify({}) to verify everything.
+            "required": [],
+        },
+    },
+}
+
+
 # ── Dispatch table for the agent loop ────────────────────────────────────
 
 AVAILABLE_TOOLS = {
-    "log_search": log_search,
+    "log_search":  log_search,
+    "hmac_verify": hmac_verify,
 }

@@ -1,11 +1,19 @@
 """
-cli.py — sitting 1 end-to-end test.
+cli.py — sitting 2 end-to-end test.
 
-Runs one hardcoded forensic question through the agent loop and prints
-(a) each tool call with arguments, (b) each tool result truncated to
-the first three entries for readability, (c) the final answer.
+Runs three hardcoded forensic questions through the agent loop and
+prints (a) each tool call with arguments, (b) each tool result
+truncated to the first three entries for readability, (c) the final
+answer. Separator between queries.
 
-Exit code 0 on success, 1 if the agent errors out before producing a
+Expected tool selection (the model's routing is the primary thing
+being tested):
+
+  Q1 (content)    → log_search only
+  Q2 (integrity)  → hmac_verify only
+  Q3 (mixed)      → both tools
+
+Exit code 0 on success, 1 if any query errors out before producing a
 final answer.
 """
 from __future__ import annotations
@@ -18,15 +26,36 @@ from typing import Any
 from agent import run_agent
 from tools import _resolve_log_path
 
-TEST_QUERY = "Find all admin authentication events from the last 24 hours."
+QUERIES = [
+    ("Q1 — content",
+     "Find all admin authentication events from the last 24 hours."),
+    ("Q2 — integrity",
+     "Is the audit log chain intact for the last 1000 entries?"),
+    ("Q3 — mixed",
+     "Did anyone access privileged documents outside business hours, "
+     "and is that part of the log tamper-free?"),
+]
 
 
-def _truncate(result: Any, head: int = 3) -> Any:
-    """Cap a list-of-dicts at `head` entries for terminal display."""
+def _truncate(result: Any, head: int = 3) -> tuple[Any, str]:
     if isinstance(result, list):
         suffix = f" ... [+{len(result) - head} more]" if len(result) > head else ""
         return result[:head], suffix
     return result, ""
+
+
+def _format_log_entry(entry: dict) -> str:
+    ts = entry.get("timestamp", "?")
+    uh = (entry.get("user_hash") or "")[:12]
+    model = entry.get("model", "?")
+    matter = entry.get("matter_code") or "-"
+    return f"  - {ts}  user={uh}  model={model}  matter={matter}"
+
+
+def _format_failure(f: dict) -> str:
+    return (f"  - seq={f.get('seq')}  ts={f.get('timestamp')}  "
+            f"stored={f.get('stored_hmac','')[:12]}…  "
+            f"expected={f.get('expected_hmac','')[:12]}…")
 
 
 def _emit(kind: str, payload: dict[str, Any]) -> None:
@@ -34,54 +63,70 @@ def _emit(kind: str, payload: dict[str, Any]) -> None:
         print(f"\n[Agent] Iteration {payload['n']}")
     elif kind == "tool_call":
         name = payload["name"]
-        # The model's tool_calls.function.arguments is a JSON string;
-        # decode it for display but don't choke on malformed JSON.
         try:
-            args = json.loads(payload["args_raw"])
-            args_repr = ", ".join(f"{k}={v!r}" for k, v in args.items())
+            args = json.loads(payload["args_raw"]) if payload["args_raw"] else {}
+            args_repr = ", ".join(f"{k}={v!r}" for k, v in args.items()) or "<no args>"
         except json.JSONDecodeError:
-            args_repr = f"<unparsed JSON: {payload['args_raw']!r}>"
+            args_repr = f"<unparsed: {payload['args_raw']!r}>"
         print(f"[Agent] Tool call: {name}({args_repr})")
     elif kind == "tool_result":
+        name = payload["name"]
         result = payload["result"]
-        head, suffix = _truncate(result, head=3)
-        if isinstance(result, list):
-            print(f"[Tool ] Returned {len(result)} entries:")
-            for entry in head:
-                # Compact one-line summary for terminal sanity
-                ts = entry.get("timestamp", "?")
-                uh = (entry.get("user_hash") or "")[:12]
-                model = entry.get("model", "?")
-                matter = entry.get("matter_code") or "-"
-                print(f"  - {ts}  user={uh}  model={model}  matter={matter}")
+        if isinstance(result, dict) and "error" in result:
+            print(f"[Tool ] ERROR: {result['error']}")
+            return
+        if name == "log_search" and isinstance(result, list):
+            head, suffix = _truncate(result, head=3)
+            print(f"[Tool ] log_search → {len(result)} entries:")
+            for e in head:
+                print(_format_log_entry(e))
             if suffix:
                 print(f"  {suffix.strip()}")
-        elif isinstance(result, dict) and "error" in result:
-            print(f"[Tool ] ERROR: {result['error']}")
+        elif name == "hmac_verify" and isinstance(result, dict):
+            v = result
+            ok = "INTACT" if v.get("chain_intact") else "BROKEN"
+            print(f"[Tool ] hmac_verify → chain {ok}  "
+                  f"verified={v.get('verified_count')}/{v.get('total_count')}  "
+                  f"first_failure_seq={v.get('first_failure_seq')}")
+            if v.get("failures"):
+                print(f"  failures ({len(v['failures'])} shown, capped at 10):")
+                for f in v["failures"][:3]:
+                    print(_format_failure(f))
         else:
-            print(f"[Tool ] {json.dumps(result, indent=2)[:500]}")
+            text = json.dumps(result, indent=2)
+            print(f"[Tool ] {text[:500]}{' ...' if len(text) > 500 else ''}")
     elif kind == "final":
         capped = payload.get("capped")
         marker = " (capped at MAX_ITERATIONS)" if capped else ""
-        print(f"\n[Agent] Final answer (after {payload['iterations']} iteration(s){marker}):")
+        print(f"\n[Agent] Final answer (after {payload['iterations']} "
+              f"iteration(s){marker}):")
         print(payload["text"])
 
 
 def main() -> int:
     log_path = _resolve_log_path()
-    print(f"=== locallyai-audit-agent — sitting 1 ===")
+    print("=" * 70)
+    print("=== locallyai-audit-agent — sitting 2 ===")
     print(f"  Audit log:   {log_path}  (exists={log_path.exists()})")
     print(f"  Base URL:    {os.getenv('BASE_URL', 'http://localhost:11434/v1')}")
     print(f"  Model:       {os.getenv('MODEL', 'qwen2.5:14b')}")
-    print(f"  Query:       {TEST_QUERY!r}")
-    print("=" * 50)
+    print(f"  HMAC key:    {'set' if os.environ.get('LOCALLYAI_AUDIT_HMAC_KEY') else 'NOT SET — hmac_verify will raise'}")
+    print("=" * 70)
 
-    try:
-        run_agent(TEST_QUERY, on_event=_emit)
-    except Exception as e:
-        print(f"\n[ERROR] {type(e).__name__}: {e}", file=sys.stderr)
-        return 1
-    return 0
+    rc = 0
+    for label, query in QUERIES:
+        print(f"\n{'-' * 70}")
+        print(f"{label}: {query!r}")
+        print("-" * 70)
+        try:
+            run_agent(query, on_event=_emit)
+        except Exception as e:
+            print(f"\n[ERROR] {type(e).__name__}: {e}", file=sys.stderr)
+            rc = 1
+
+    print("\n" + "=" * 70)
+    print("Done.")
+    return rc
 
 
 if __name__ == "__main__":

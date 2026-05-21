@@ -26,7 +26,7 @@ from typing import Any, Callable
 
 from openai import OpenAI
 
-from tools import AVAILABLE_TOOLS, LOG_SEARCH_SCHEMA
+from tools import AVAILABLE_TOOLS, HMAC_VERIFY_SCHEMA, LOG_SEARCH_SCHEMA
 
 
 # ── Configuration ─────────────────────────────────────────────────────────
@@ -42,16 +42,23 @@ MAX_ITERATIONS = 5
 ENV_MODEL = os.getenv("MODEL", "").strip() or None
 
 SYSTEM_PROMPT = (
-    "You are a forensic auditor with access to LocallyAI's tamper-evident "
-    "audit log. The log is HMAC-chained (`_chain_hmac` per entry) and "
-    "pseudonymised: usernames are SHA-256 hashes in `user_hash`, and query "
-    "text is never stored — only its SHA-256 in `query_hash`. Use the "
-    "log_search tool to investigate the user's question. Cite specific "
-    "entries by timestamp and `user_hash` prefix (first 12 chars) in your "
-    "answer. If the question cannot be answered because the relevant data "
-    "is intentionally not in the log (e.g. plain-text usernames, query "
-    "text), say so explicitly and explain what IS in the log that bears "
-    "on the question."
+    "You are a forensic auditor for LocallyAI's tamper-evident, "
+    "HMAC-chained audit log. You have two tools:\n"
+    "  - `log_search` for CONTENT questions (what happened, who did "
+    "    what, find entries matching X).\n"
+    "  - `hmac_verify` for INTEGRITY questions (is the chain intact, "
+    "    has the log been tampered with, verify range N to M).\n"
+    "If a question mixes both — e.g. 'did X happen AND is that part "
+    "of the log tamper-free?' — call both tools and combine the "
+    "results in your answer.\n\n"
+    "The log is pseudonymised by design: usernames are SHA-256 hashes "
+    "in `user_hash`; query text is never stored, only its SHA-256 in "
+    "`query_hash`. Cite specific entries by timestamp + `user_hash` "
+    "prefix (first 12 chars). For integrity findings, cite the "
+    "`first_failure_seq` and the affected entry's timestamp. If a "
+    "question can't be answered because the relevant data is "
+    "intentionally not in the log (plain-text usernames, query text), "
+    "say so explicitly."
 )
 
 
@@ -104,7 +111,7 @@ def run_agent(
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_query},
     ]
-    tools = [LOG_SEARCH_SCHEMA]
+    tools = [LOG_SEARCH_SCHEMA, HMAC_VERIFY_SCHEMA]
     model = model or ENV_MODEL or DEFAULT_MODEL
 
     for iteration in range(1, MAX_ITERATIONS + 1):
