@@ -206,8 +206,10 @@ relevant time range / matching the relevant model field"*.
 ## Dependencies
 
 ```
-openai     (Python client — talks to Ollama via OpenAI-compatible API)
+openai     (Python client — talks to Ollama/LM Studio via OpenAI-compatible API)
 pydantic   (kept for v2 schemas in later sittings)
+pyyaml     (sitting 4 — eval/dataset.yaml)
+anthropic  (sitting 4 — Claude judge, DEV-ONLY, see "Eval suite" below)
 ```
 
 Install:
@@ -215,7 +217,7 @@ Install:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install openai pydantic
+pip install openai pydantic pyyaml anthropic
 ```
 
 ## Run
@@ -234,13 +236,117 @@ BASE_URL=https://office-mac.local:8000/v1 python cli.py
 `cli.py` ships one hardcoded test query and prints each tool call,
 each tool result, and the final answer.
 
+## Eval suite
+
+Sitting 4 added a 30-question eval suite over the four-tool agent.
+Every change to the agent (prompt, model, tool description, fixture)
+is now measurable rather than vibes-graded.
+
+### Dataset
+
+[`eval/dataset.yaml`](eval/dataset.yaml) — 30 questions distributed:
+
+| Category | Count | What it tests |
+|---|---|---|
+| `log_search` | 8 | keyword routing, pseudonymisation tripwires, hallucination guards |
+| `time_range` | 6 | precise ISO-8601 window filtering, event_type filter, ascending sort |
+| `aggregation` | 6 | all four `group_by` values (`user`, `event_type`, `hour_of_day`, `day`); top-N edge cases |
+| `integrity` | 5 | clean + tampered fixtures; range-scoped verify; citation precision |
+| `multi_tool` | 5 | 2+ tool sequences including the hardest "busiest day + chain integrity for that day" case on a tampered fixture |
+
+Each question carries `expected_tools`, ground-truth facts, required + forbidden substrings (hallucination guards), difficulty (easy/medium/hard), and `log_fixture` (clean or tampered). Ground truth is anchored to the **real** LocallyAI audit log on the developer machine — 10 entries, one pseudonymised user, 2 days, the chain intact on `clean` and broken at seq=5 on `tampered`.
+
+Fixtures live under `eval/fixtures/` (gitignored — they contain timestamped data from the live LocallyAI deployment). [`eval/fixtures.py`](eval/fixtures.py) rebuilds them idempotently from the live log; the tamper at seq=5 is deterministic so the eval is reproducible.
+
+### Configuring the cloud judge
+
+> **Important.** The agent itself stays fully air-gapped at runtime. The eval **judge** is the **one place** in the codebase where the air-gap rule is relaxed: it calls Claude (`api.anthropic.com`) to grade the agent's answers against the dataset's ground-truth facts. This is **dev-only tooling** — the judge never ships into a regulated-industry deployment. The distinction is intentional and matters for the pitch: judging is a developer-side measurement activity, not part of the agent the firm runs.
+
+The judge calls Claude Haiku 4.5 by default (cheap, fast, sufficient for the structured boolean grading the prompt asks for). To use it:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+# Optional: switch to a stronger judge for closer calls
+export JUDGE_MODEL=claude-sonnet-4-6-20251022
+```
+
+The judge **never sees the audit log** — it sees only the question, ground-truth facts, the agent's answer, and the tools the agent called. That separation is what keeps the eval deterministic across log changes.
+
+### Running the eval
+
+```bash
+# full 30-question run (~10–15 min on Qwen 2.5 Coder 7B via LM Studio,
+# 20–40 min on Qwen 2.5 14B via Ollama)
+set -a; source /path/to/locallyai/.env; set +a       # LOCALLYAI_AUDIT_HMAC_KEY
+export BASE_URL=http://localhost:1234/v1
+export MODEL=qwen2.5-coder-7b-instruct-mlx
+export ANTHROPIC_API_KEY=sk-ant-...
+python -m eval.run
+
+# or equivalently via the cli.py entry point
+python cli.py --eval
+
+# debug flags
+python -m eval.run --limit 5                         # first 5 questions only
+python -m eval.run --start-from q15 --resume-into eval/runs/<existing>.jsonl
+python -m eval.run --no-judge                        # offline dry-run (no Claude call)
+```
+
+Output lands in [`eval/runs/`](eval/runs/):
+
+- `<stamp>.jsonl` — one line per question (`id`, `category`, `tools_called`, `answer`, `judge:{tool_pass,answer_pass,rationale,…}`, `trace_path`, `agent_latency_ms`)
+- `<stamp>_summary.md` — overall + per-category + per-difficulty pass rates, failed-question list with judge rationales, total runtime, judge token usage + estimated cost
+
+### Comparing runs
+
+```bash
+python -m eval.compare eval/runs/<base>.jsonl eval/runs/<new>.jsonl
+```
+
+Surfaces (a) per-question status flips (pass → fail, fail → pass), (b) per-category pass-rate deltas, (c) overall per-axis deltas. This is the tool to reach for every time you tighten a prompt, swap a model, or refactor a tool description.
+
+### Baseline (2026-05-21)
+
+First baseline run committed at [`eval/runs/2026-05-21T192709Z.jsonl`](eval/runs/2026-05-21T192709Z.jsonl) + [`_summary.md`](eval/runs/2026-05-21T192709Z_summary.md). All 30 questions ran end-to-end against `qwen2.5-coder-7b-instruct-mlx` via LM Studio; runtime 5.6 min.
+
+**The judge ran out of Anthropic credit after question 8.** 22 of 30 questions have valid grades; 22 have `judge_error=true` (the JSONL records the agent's answer + tool calls for every question, so re-grading after topping up is a no-cost run). Honest numbers from the validly-graded subset only:
+
+| Axis | Rate (graded only) |
+|---|---|
+| Tool selection | 7 / 8 (87.5%) |
+| Answer correctness | 2 / 8 (25.0%) |
+| Both axes | 2 / 8 (25.0%) |
+
+By category (graded subset is `log_search` only — the credit ran out before any other category got judged):
+
+| Category | Both pass | Tool pass | Answer pass |
+|---|---|---|---|
+| `log_search` | 2/8 (25.0%) | 7/8 (87.5%) | 2/8 (25.0%) |
+| `time_range` | — (no graded rows) | — | — |
+| `aggregation` | — (no graded rows) | — | — |
+| `integrity` | — (no graded rows) | — | — |
+| `multi_tool` | — (no graded rows) | — | — |
+
+**Honest read:** the agent reliably picks the right tool on simple content questions (7/8 tool-pass) but the model hallucinates content on questions where the answer requires reading the search results carefully (e.g. q02 — the agent searched for `"MLX"`, got 0 hits because the model field is `"mlx-community/..."` lowercased, and then **confabulated** "no entries used the MLX backend" instead of broadening the search). This is exactly the kind of failure mode the eval is meant to expose.
+
+**Next-session task:** top up the Anthropic balance, re-grade the remaining 22 questions with `python -m eval.run --start-from q09 --resume-into eval/runs/2026-05-21T192709Z.jsonl`, then begin the prompt + tool-description tuning loop in sitting 5 with `python -m eval.compare` reporting deltas against this baseline.
+
+### Honest limits
+
+- One judge (Claude Haiku 4.5). No model-vs-model judge matrices.
+- 30 questions, not 100. Quality of questions over count for v1.
+- Markdown summary; no HTML dashboard, no charts.
+- The dataset's ground truth is currently anchored to a 10-entry log on the developer machine. Re-generating the fixtures against a richer log requires updating `ground_truth_facts` in `dataset.yaml` for any quantitative claim that depends on counts.
+
+---
+
 ## Roadmap
 
 - ~~**Sitting 1** — `log_search` + the OpenAI-shaped agent loop.~~ ✓ shipped
 - ~~**Sitting 2** — `hmac_verify` + system-prompt tool-routing + tamper-detection smoke test.~~ ✓ shipped
 - ~~**Sitting 3** — `time_range_query`, `summary_stats`, per-run JSONL tracing + `trace_viewer.py`.~~ ✓ shipped
-- **Sitting 4** — 30-question eval suite (the traces from sitting 3 are the input). Model swap to Qwen 2.5 14B Instruct once a working build is available; quantify the routing-quality / answer-quality delta vs Coder 7B on the eval.
-- **Sitting 5** — FastAPI server + per-firm deployment as a `/admin/forensics/ask` endpoint behind `_admin_auth`.
+- ~~**Sitting 4** — 30-question eval suite + Claude judge + run comparator + baseline.~~ ✓ shipped
+- **Sitting 5** — Prompt + tool-description tuning to lift the baseline. Use `eval/compare.py` to verify every change. Also: swap to Qwen 2.5 14B Instruct (or a stronger Coder variant) once a working build is available; quantify the model-quality delta against the baseline. FastAPI server + per-firm deployment as a `/admin/forensics/ask` endpoint behind `_admin_auth`.
 
 ## Known drift risk
 

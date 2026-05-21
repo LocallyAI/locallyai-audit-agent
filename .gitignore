@@ -8,3 +8,8 @@ __pycache__/
 .DS_Store
 # Per-run agent traces (one JSONL per run_agent invocation)
 traces/
+# Eval fixtures contain timestamped audit-log data from the live
+# LocallyAI deployment on this machine; the builder regenerates
+# them idempotently so they don't need to be in git.
+eval/fixtures/clean/
+eval/fixtures/tampered/

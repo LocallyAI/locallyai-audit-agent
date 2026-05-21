@@ -1,0 +1,441 @@
+# LocallyAI audit-agent eval — 30 questions
+#
+# Each question carries:
+#   id                          stable handle (q01..q30); referenced by run.py + compare.py
+#   category                    log_search | time_range | aggregation | integrity | multi_tool
+#   question                    the prompt fed to the agent verbatim
+#   expected_tools              ordered list of tool names the agent should call at least once
+#   expected_answer_contains    case-insensitive substrings every passing answer must include
+#   expected_answer_excludes    case-insensitive substrings a passing answer MUST NOT include
+#                               (these are the hallucination tripwires — invented names,
+#                               wrong tool nouns, false "intact" claims on tampered fixtures)
+#   ground_truth_facts          what the judge tells Claude is true. NEVER the audit log itself.
+#   difficulty                  easy | medium | hard
+#   log_fixture                 clean | tampered  (run.py sets LOCALLYAI_AUDIT_LOG accordingly)
+#   notes                       intent / what's being tested
+#
+# Ground truth derived from the real LocallyAI audit log on this machine:
+#   10 entries total; 1 unique user_hash 8bcc65a8fac92c0f; 2 days
+#   (2026-05-14 ×2, 2026-05-15 ×8); 2 hours (16 ×8, 21 ×2);
+#   9 chat events + 1 non_chat event; matter_codes ('' ×9, 'M-2026-0042' ×1);
+#   chain INTACT on clean / BROKEN at seq=5 on tampered fixture.
+#
+# Distribution (per spec):
+#   8 log_search · 6 time_range · 6 aggregation · 5 integrity · 5 multi_tool = 30
+#   integrity: 2 clean / 3 tampered
+#   aggregation: each of {user, event_type, hour_of_day, day} appears at least once
+#   difficulty: 9 easy · 12 medium · 9 hard (slight lean to medium/hard, the
+#   ones that actually matter for routing-quality measurement)
+
+# ─── log_search (8) ────────────────────────────────────────────────────
+
+- id: q01
+  category: log_search
+  question: "Find any entries that mention the matter code M-2026-0042."
+  expected_tools: [log_search]
+  expected_answer_contains: ["M-2026-0042"]
+  expected_answer_excludes: []
+  ground_truth_facts:
+    - "Exactly one entry has matter_code='M-2026-0042'."
+    - "That entry is at sequence 1, timestamp 2026-05-14T21:23:08Z, user_hash 8bcc65a8fac92c0f."
+    - "It is a non-chat event (model field is '-')."
+  difficulty: easy
+  log_fixture: clean
+  notes: "Trivial substring routing — log_search should be selected unambiguously."
+
+- id: q02
+  category: log_search
+  question: "Which entries used the MLX inference backend?"
+  expected_tools: [log_search]
+  expected_answer_contains: ["mlx"]
+  expected_answer_excludes: ["ollama", "lm studio", "lmstudio", "vllm"]
+  ground_truth_facts:
+    - "All 10 entries have backend='mlx'."
+    - "9 of them are chat events using model 'mlx-community/Qwen2.5-7B-Instruct-4bit'."
+    - "1 of them is a non-chat event with model field '-' but backend still 'mlx'."
+  difficulty: easy
+  log_fixture: clean
+  notes: "log_search query='mlx' is the expected route. 'ollama' / 'lmstudio' must NOT appear."
+
+- id: q03
+  category: log_search
+  question: "Search for entries referencing a Qwen model."
+  expected_tools: [log_search]
+  expected_answer_contains: ["Qwen"]
+  expected_answer_excludes: ["GPT-4", "Claude", "Llama"]
+  ground_truth_facts:
+    - "9 entries reference Qwen2.5-7B-Instruct-4bit in the model field."
+    - "1 entry has model='-' and does not reference any model."
+  difficulty: easy
+  log_fixture: clean
+  notes: "Hallucination guard: must not fabricate other model names."
+
+- id: q04
+  category: log_search
+  question: "Find all admin authentication events from the last 24 hours."
+  expected_tools: [log_search]
+  expected_answer_contains: ["pseudonym", "user_hash"]
+  expected_answer_excludes: ["alice", "bob", "carol", "admin@", "admin user found"]
+  ground_truth_facts:
+    - "The audit log pseudonymises usernames as SHA-256 hashes in 'user_hash'."
+    - "There is no plain-text 'admin' string in any entry — substring search for 'admin' returns 0 entries."
+    - "A correct answer explains the pseudonymisation property rather than claiming a user is missing."
+  difficulty: medium
+  log_fixture: clean
+  notes: "The pseudonymisation tripwire from sitting 1. Must NOT hallucinate user names."
+
+- id: q05
+  category: log_search
+  question: "Are there entries with a non-empty matter code?"
+  expected_tools: [log_search]
+  expected_answer_contains: ["1", "M-2026-0042"]
+  expected_answer_excludes: []
+  ground_truth_facts:
+    - "Exactly 1 of the 10 entries carries a non-empty matter_code: 'M-2026-0042' at seq 1."
+    - "The other 9 entries have matter_code=''."
+  difficulty: medium
+  log_fixture: clean
+  notes: "Counting via search — model should report 1, not the total 10."
+
+- id: q06
+  category: log_search
+  question: "Show me the most recent activity in the audit log."
+  expected_tools: [log_search]
+  expected_answer_contains: ["2026-05-15", "16:10"]
+  expected_answer_excludes: []
+  ground_truth_facts:
+    - "The most recent entry is at 2026-05-15T16:10:01Z (sequence 10)."
+    - "It is a chat event with sources=5 and user_hash 8bcc65a8fac92c0f."
+    - "log_search with empty query returns entries newest-first."
+  difficulty: easy
+  log_fixture: clean
+  notes: "Newest-first ordering check."
+
+- id: q07
+  category: log_search
+  question: "Did anyone search for documents in Arabic?"
+  expected_tools: [log_search]
+  expected_answer_contains: ["query_hash", "not stored"]
+  expected_answer_excludes: ["yes, several queries", "found arabic"]
+  ground_truth_facts:
+    - "Query text is never stored — only its SHA-256 in 'query_hash'."
+    - "There is no language metadata on queries."
+    - "The correct answer explains that query content cannot be searched by text; only query_hash values are recorded."
+  difficulty: hard
+  log_fixture: clean
+  notes: "Privacy-property tripwire. Must NOT claim any text-content match."
+
+- id: q08
+  category: log_search
+  question: "Find entries from the UK data region."
+  expected_tools: [log_search]
+  expected_answer_contains: ["UK", "10"]
+  expected_answer_excludes: ["KSA", "EU", "US"]
+  ground_truth_facts:
+    - "All 10 entries have data_region='UK'."
+    - "There are zero entries in other regions on this deployment."
+  difficulty: easy
+  log_fixture: clean
+  notes: "Region-filter content match. Counting should yield 10."
+
+# ─── time_range (6) ────────────────────────────────────────────────────
+
+- id: q09
+  category: time_range
+  question: "What events happened on 2026-05-14?"
+  expected_tools: [time_range_query]
+  expected_answer_contains: ["2", "2026-05-14"]
+  expected_answer_excludes: ["no entries", "no activity"]
+  ground_truth_facts:
+    - "There are exactly 2 entries on 2026-05-14."
+    - "They are at 21:23:08Z (non-chat, matter_code M-2026-0042) and 21:32:50Z (chat)."
+    - "Both share user_hash 8bcc65a8fac92c0f."
+  difficulty: easy
+  log_fixture: clean
+  notes: "Day-window time_range."
+
+- id: q10
+  category: time_range
+  question: "List all entries from 2026-05-15 between 16:00 and 17:00 UTC."
+  expected_tools: [time_range_query]
+  expected_answer_contains: ["8", "2026-05-15", "16:"]
+  expected_answer_excludes: []
+  ground_truth_facts:
+    - "There are 8 entries in the 16:00–17:00 hour window on 2026-05-15."
+    - "Timestamps: 16:03:47, 16:08:12, 16:08:17, 16:08:20, 16:08:24, 16:08:56, 16:09:55, 16:10:01."
+    - "All 8 are chat events."
+  difficulty: easy
+  log_fixture: clean
+  notes: "Sub-day window."
+
+- id: q11
+  category: time_range
+  question: "Show me non-chat administrative events from 2026-05-14."
+  expected_tools: [time_range_query]
+  expected_answer_contains: ["1", "2026-05-14T21:23"]
+  expected_answer_excludes: ["chat completion", "no events"]
+  ground_truth_facts:
+    - "Exactly 1 non-chat event on 2026-05-14, at 21:23:08Z."
+    - "It has matter_code='M-2026-0042' and model='-' (non-chat marker)."
+    - "Should be filtered by event_type='admin' or 'non_chat'."
+  difficulty: medium
+  log_fixture: clean
+  notes: "Tests event_type filter routing."
+
+- id: q12
+  category: time_range
+  question: "What activity occurred between 21:00 and 22:00 UTC on 2026-05-14?"
+  expected_tools: [time_range_query]
+  expected_answer_contains: ["2", "21:23", "21:32"]
+  expected_answer_excludes: []
+  ground_truth_facts:
+    - "There are 2 entries in the 21:00–22:00 hour window on 2026-05-14."
+    - "21:23:08Z (non-chat) and 21:32:50Z (chat)."
+  difficulty: medium
+  log_fixture: clean
+  notes: "Narrow hour window, mixed event types."
+
+- id: q13
+  category: time_range
+  question: "What was the first chat event of 2026-05-15?"
+  expected_tools: [time_range_query]
+  expected_answer_contains: ["16:03:47"]
+  expected_answer_excludes: ["21:", "2026-05-14"]
+  ground_truth_facts:
+    - "The first chat event on 2026-05-15 is at 16:03:47Z (sequence 3)."
+    - "It is a chat completion with sources=0 and user_hash 8bcc65a8fac92c0f."
+    - "time_range_query with start=2026-05-15T00:00:00Z, end=2026-05-15T23:59:59Z, event_type=chat, ordered ascending, first entry."
+  difficulty: hard
+  log_fixture: clean
+  notes: "Implicit 'first of' requires ascending sort + event_type filter."
+
+- id: q14
+  category: time_range
+  question: "Were there any entries between 2026-05-15T16:08:00Z and 2026-05-15T16:09:00Z?"
+  expected_tools: [time_range_query]
+  expected_answer_contains: ["4", "16:08"]
+  expected_answer_excludes: ["no entries", "0 entries"]
+  ground_truth_facts:
+    - "There are 4 entries in this minute window: 16:08:12, 16:08:17, 16:08:20, 16:08:24."
+    - "All 4 are chat events."
+  difficulty: hard
+  log_fixture: clean
+  notes: "Narrow minute-resolution window. The agent must use precise timestamps."
+
+# ─── aggregation (6 — all four group_by values covered) ─────────────────
+
+- id: q15
+  category: aggregation
+  question: "Break down activity by event type — how many chat vs non-chat events?"
+  expected_tools: [summary_stats]
+  expected_answer_contains: ["9", "1", "chat", "non_chat"]
+  expected_answer_excludes: []
+  ground_truth_facts:
+    - "summary_stats(group_by='event_type') returns: chat=9, non_chat=1, total=10."
+  difficulty: easy
+  log_fixture: clean
+  notes: "group_by=event_type — easiest aggregation."
+
+- id: q16
+  category: aggregation
+  question: "How many distinct users have activity in this audit log?"
+  expected_tools: [summary_stats]
+  expected_answer_contains: ["1", "8bcc65a8"]
+  expected_answer_excludes: ["2 users", "3 users", "5 users"]
+  ground_truth_facts:
+    - "There is exactly 1 distinct user_hash: 8bcc65a8fac92c0f."
+    - "That user accounts for all 10 entries."
+    - "summary_stats(group_by='user') returns a single bucket."
+  difficulty: easy
+  log_fixture: clean
+  notes: "group_by=user. Should NOT hallucinate multiple users."
+
+- id: q17
+  category: aggregation
+  question: "Which hour of day has the most activity?"
+  expected_tools: [summary_stats]
+  expected_answer_contains: ["16", "8"]
+  expected_answer_excludes: []
+  ground_truth_facts:
+    - "summary_stats(group_by='hour_of_day') returns: 16:00 with 8 events, 21:00 with 2 events."
+    - "Hour 16 is the busiest."
+  difficulty: medium
+  log_fixture: clean
+  notes: "group_by=hour_of_day."
+
+- id: q18
+  category: aggregation
+  question: "Show me a per-day breakdown of activity."
+  expected_tools: [summary_stats]
+  expected_answer_contains: ["2026-05-15", "2026-05-14", "8", "2"]
+  expected_answer_excludes: []
+  ground_truth_facts:
+    - "summary_stats(group_by='day') returns: 2026-05-15 with 8 events, 2026-05-14 with 2 events."
+  difficulty: medium
+  log_fixture: clean
+  notes: "group_by=day."
+
+- id: q19
+  category: aggregation
+  question: "What proportion of events are chat completions vs administrative actions?"
+  expected_tools: [summary_stats]
+  expected_answer_contains: ["9", "1"]
+  expected_answer_excludes: ["50%", "equal", "half"]
+  ground_truth_facts:
+    - "Chat events: 9 of 10 (90%). Non-chat: 1 of 10 (10%)."
+    - "summary_stats(group_by='event_type') provides these counts."
+  difficulty: hard
+  log_fixture: clean
+  notes: "Proportion question — model must compute the ratio from counts. Must not fabricate '50%'."
+
+- id: q20
+  category: aggregation
+  question: "Who are the top three most active users this month?"
+  expected_tools: [summary_stats]
+  expected_answer_contains: ["1", "8bcc65a8"]
+  expected_answer_excludes: ["top three", "three users"]
+  ground_truth_facts:
+    - "There is only 1 user (8bcc65a8fac92c0f) — cannot produce a top-3 list."
+    - "A correct answer reports the actual user count and explains that fewer than three exist."
+    - "summary_stats(group_by='user') with optional time window in May 2026."
+  difficulty: hard
+  log_fixture: clean
+  notes: "Top-N question where N exceeds the cardinality. Must not fabricate two more users."
+
+# ─── integrity (5 — 2 clean, 3 tampered) ──────────────────────────────
+
+- id: q21
+  category: integrity
+  question: "Is the audit log chain valid?"
+  expected_tools: [hmac_verify]
+  expected_answer_contains: ["intact", "10"]
+  expected_answer_excludes: ["broken", "tampered", "fail"]
+  ground_truth_facts:
+    - "Clean fixture: hmac_verify returns chain_intact=true, verified=10/10."
+    - "first_failure_seq is null."
+  difficulty: easy
+  log_fixture: clean
+  notes: "Baseline integrity question on clean log."
+
+- id: q22
+  category: integrity
+  question: "Is the audit log tamper-free?"
+  expected_tools: [hmac_verify]
+  expected_answer_contains: ["broken", "5"]
+  expected_answer_excludes: ["intact", "tamper-free", "not tampered"]
+  ground_truth_facts:
+    - "Tampered fixture: hmac_verify returns chain_intact=false."
+    - "first_failure_seq=5, affected timestamp 2026-05-15T16:08:17Z, verified=9/10."
+    - "Answer MUST cite seq 5 and MUST NOT claim the log is intact."
+  difficulty: easy
+  log_fixture: tampered
+  notes: "Smoke-test parity on tampered fixture."
+
+- id: q23
+  category: integrity
+  question: "Verify the integrity of the first 5 entries in the log."
+  expected_tools: [hmac_verify]
+  expected_answer_contains: ["intact", "5"]
+  expected_answer_excludes: ["broken", "tampered"]
+  ground_truth_facts:
+    - "Clean fixture: hmac_verify(start_seq=1, end_seq=5) returns chain_intact=true, verified=5/5."
+  difficulty: medium
+  log_fixture: clean
+  notes: "Range-scoped verify on clean log."
+
+- id: q24
+  category: integrity
+  question: "Has anything been modified in the audit log recently?"
+  expected_tools: [hmac_verify]
+  expected_answer_contains: ["broken", "5", "matter_code"]
+  expected_answer_excludes: ["intact", "no modification"]
+  ground_truth_facts:
+    - "Tampered fixture: hmac_verify finds the break at seq=5."
+    - "The mutated field was matter_code (changed to 'M-TAMPER-EVAL' for the eval fixture)."
+    - "Answer must report tampering AND cite seq 5."
+  difficulty: medium
+  log_fixture: tampered
+  notes: "Open-ended phrasing; model must still route to hmac_verify."
+
+- id: q25
+  category: integrity
+  question: "If the log has been tampered with, identify the exact sequence number where the break occurs and the timestamp of that entry."
+  expected_tools: [hmac_verify]
+  expected_answer_contains: ["5", "2026-05-15T16:08:17"]
+  expected_answer_excludes: ["intact", "no tampering"]
+  ground_truth_facts:
+    - "Tampered fixture: hmac_verify reports first_failure_seq=5 at timestamp 2026-05-15T16:08:17Z."
+    - "Answer MUST cite both seq 5 AND the timestamp."
+  difficulty: hard
+  log_fixture: tampered
+  notes: "Demands citation precision — the demo moment for the integrity story."
+
+# ─── multi_tool (5) ────────────────────────────────────────────────────
+
+- id: q26
+  category: multi_tool
+  question: "Did anyone touch the matter M-2026-0042, and is the entry for that touch chain-verified?"
+  expected_tools: [log_search, hmac_verify]
+  expected_answer_contains: ["M-2026-0042", "intact"]
+  expected_answer_excludes: ["broken", "tampered"]
+  ground_truth_facts:
+    - "Clean fixture: one entry at seq=1 (2026-05-14T21:23:08Z) has matter_code='M-2026-0042'."
+    - "Chain is intact (verified=10/10 on the clean fixture)."
+  difficulty: medium
+  log_fixture: clean
+  notes: "Both tools required: content lookup + chain verification."
+
+- id: q27
+  category: multi_tool
+  question: "Which hour of day was busiest, and how many of those entries verify as chain-intact?"
+  expected_tools: [summary_stats, hmac_verify]
+  expected_answer_contains: ["16", "8", "intact"]
+  expected_answer_excludes: ["broken"]
+  ground_truth_facts:
+    - "summary_stats(group_by='hour_of_day') reports hour 16 with 8 events."
+    - "Clean fixture: hmac_verify chain_intact=true, all 8 hour-16 entries verify."
+  difficulty: medium
+  log_fixture: clean
+  notes: "Aggregation feeds integrity. Model may parallelise or sequence the calls."
+
+- id: q28
+  category: multi_tool
+  question: "Which day had the most activity, and is the chain still intact for that day's entries?"
+  expected_tools: [summary_stats, hmac_verify]
+  expected_answer_contains: ["2026-05-15", "8", "broken", "5"]
+  expected_answer_excludes: ["intact", "tamper-free"]
+  ground_truth_facts:
+    - "Tampered fixture: summary_stats(group_by='day') reports 2026-05-15 with 8 events as busiest."
+    - "hmac_verify reports chain_intact=false, first_failure_seq=5 — seq 5 is on 2026-05-15."
+    - "Answer must combine both: busiest day = 2026-05-15 AND chain broken at seq 5."
+  difficulty: hard
+  log_fixture: tampered
+  notes: "Two-tool sequencing on a tampered fixture — the hardest case."
+
+- id: q29
+  category: multi_tool
+  question: "How many chat operations happened on 2026-05-15, and which user did them?"
+  expected_tools: [time_range_query, summary_stats]
+  expected_answer_contains: ["8", "8bcc65a8"]
+  expected_answer_excludes: ["multiple users", "two users"]
+  ground_truth_facts:
+    - "On 2026-05-15 there are 8 chat events, all by user_hash 8bcc65a8fac92c0f."
+    - "Either time_range_query(event_type='chat') + summary_stats(group_by='user', start/end), or any combination that arrives at the answer."
+  difficulty: hard
+  log_fixture: clean
+  notes: "Time window AND user breakdown. Multiple correct routings."
+
+- id: q30
+  category: multi_tool
+  question: "Are there any non-chat administrative events in the log? If so, are those entries chain-verified?"
+  expected_tools: [time_range_query, hmac_verify]
+  expected_answer_contains: ["1", "2026-05-14T21:23", "intact"]
+  expected_answer_excludes: ["broken", "tampered"]
+  ground_truth_facts:
+    - "Tampered fixture has the SAME 1 non-chat event at seq=1, 2026-05-14T21:23:08Z."
+    - "The tamper is at seq=5 (a chat event, NOT the non-chat one)."
+    - "hmac_verify(start_seq=1, end_seq=1) on the tampered fixture returns chain_intact=true for that single entry — the non-chat event is unaffected."
+    - "A correct answer reports the 1 non-chat event AND confirms its individual entry is intact."
+  difficulty: hard
+  log_fixture: tampered
+  notes: "Subtle multi-tool case: tampered fixture but the non-chat entry itself is clean. Tests range-scoped verify."

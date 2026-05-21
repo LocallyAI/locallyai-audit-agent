@@ -135,6 +135,13 @@ def _emit(kind: str, payload: dict[str, Any]) -> None:
 
 
 def main() -> int:
+    # --eval delegates to eval.run with all remaining args. Single entry
+    # point so a user can either run the demo (`python cli.py`) or the
+    # 30-question eval (`python cli.py --eval`).
+    if len(sys.argv) > 1 and sys.argv[1] == "--eval":
+        from eval.run import main as eval_main
+        return eval_main(sys.argv[2:])
+
     log_path = _resolve_log_path()
     print("=" * 70)
     print("=== locallyai-audit-agent — sitting 3 ===")
