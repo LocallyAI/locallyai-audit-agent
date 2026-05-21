@@ -6,3 +6,5 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .DS_Store
+# Per-run agent traces (one JSONL per run_agent invocation)
+traces/

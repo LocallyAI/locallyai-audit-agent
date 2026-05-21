@@ -1,8 +1,8 @@
 """
-agent.py — tool-use loop, sitting 1.
+agent.py — tool-use loop with per-run structured tracing (sitting 3).
 
-OpenAI client pointed at a local Ollama endpoint (OpenAI-compatible),
-running Qwen 2.5 14B Instruct. The loop is the standard pattern:
+OpenAI client pointed at a local Ollama / LM Studio / LocallyAI
+endpoint, running a tool-capable Qwen 2.5 family model. The loop:
 
   - send the conversation + tool schemas
   - if the response carries tool_calls: dispatch each, append the
@@ -12,21 +12,34 @@ running Qwen 2.5 14B Instruct. The loop is the standard pattern:
 A hard 5-iteration cap prevents runaway recursion if the model
 keeps calling tools or refuses to settle on a final answer.
 
+Every invocation writes one JSONL trace file under `traces/` via the
+`Tracer` from `tracing.py`. The path is returned via `on_event` as
+the `trace_started` event so the CLI can print it. Trace events
+cover user_query / model_call / tool_call / tool_result /
+final_answer (+ error on exceptions). Latencies use perf_counter().
+
 The OpenAI client + the OpenAI tool-call protocol are deliberate:
 when this codebase ships into LocallyAI's own deployment, the only
-thing that changes is `base_url` (Ollama → LocallyAI's own
-`/v1/chat/completions`). Same code path, same protocol.
+thing that changes is `base_url`. Same code path, same protocol.
 """
 from __future__ import annotations
 
 import json
 import os
 import sys
+import time
 from typing import Any, Callable
 
 from openai import OpenAI
 
-from tools import AVAILABLE_TOOLS, HMAC_VERIFY_SCHEMA, LOG_SEARCH_SCHEMA
+from tools import (
+    AVAILABLE_TOOLS,
+    HMAC_VERIFY_SCHEMA,
+    LOG_SEARCH_SCHEMA,
+    SUMMARY_STATS_SCHEMA,
+    TIME_RANGE_QUERY_SCHEMA,
+)
+from tracing import Tracer
 
 
 # ── Configuration ─────────────────────────────────────────────────────────
@@ -43,22 +56,24 @@ ENV_MODEL = os.getenv("MODEL", "").strip() or None
 
 SYSTEM_PROMPT = (
     "You are a forensic auditor for LocallyAI's tamper-evident, "
-    "HMAC-chained audit log. You have two tools:\n"
-    "  - `log_search` for CONTENT questions (what happened, who did "
-    "    what, find entries matching X).\n"
-    "  - `hmac_verify` for INTEGRITY questions (is the chain intact, "
-    "    has the log been tampered with, verify range N to M).\n"
-    "If a question mixes both — e.g. 'did X happen AND is that part "
-    "of the log tamper-free?' — call both tools and combine the "
-    "results in your answer.\n\n"
-    "The log is pseudonymised by design: usernames are SHA-256 hashes "
-    "in `user_hash`; query text is never stored, only its SHA-256 in "
-    "`query_hash`. Cite specific entries by timestamp + `user_hash` "
-    "prefix (first 12 chars). For integrity findings, cite the "
-    "`first_failure_seq` and the affected entry's timestamp. If a "
-    "question can't be answered because the relevant data is "
-    "intentionally not in the log (plain-text usernames, query text), "
-    "say so explicitly."
+    "HMAC-chained audit log. You have four tools — pick by question "
+    "shape (see each tool's description for details):\n"
+    "  - log_search       — keyword / substring content matching\n"
+    "  - time_range_query — precise ISO-8601 time window + filters\n"
+    "  - hmac_verify      — chain integrity / tamper detection\n"
+    "  - summary_stats    — counts and aggregations (group_by enum)\n"
+    "Chain multiple tools if the question mixes shapes.\n\n"
+    "The log is pseudonymised by design: usernames live as SHA-256 "
+    "hashes in `user_hash`; query text is never stored, only its "
+    "SHA-256 in `query_hash`. There is no `event_type` column — "
+    "entries with model='-' are non-chat / admin actions, entries "
+    "with a real model string are chat completions.\n\n"
+    "Cite entries by timestamp + `user_hash[:12]`. For integrity "
+    "findings, cite `first_failure_seq` and the affected timestamp. "
+    "For aggregations, cite the top buckets with their counts. "
+    "If a question can't be answered because the relevant data is "
+    "intentionally absent (plain-text usernames, query text), say "
+    "so explicitly rather than guess."
 )
 
 
@@ -92,6 +107,22 @@ def _dispatch(name: str, args_json: str, available: dict[str, Callable]) -> str:
         return json.dumps({"error": f"result not JSON-serialisable: {e}"})
 
 
+# Truncation budget for tool result strings going INTO the conversation
+# messages (NOT the JSONL trace — the trace has its own 500-char cap).
+# Keeps the context bounded when the model chains several tools across
+# iterations; 1500 chars is enough for narrative continuity without
+# bloating the next model call.
+_TOOL_RESULT_MAX_CHARS_IN_CONTEXT = 1500
+
+
+def _truncate_for_context(result_json: str) -> str:
+    if len(result_json) <= _TOOL_RESULT_MAX_CHARS_IN_CONTEXT:
+        return result_json
+    return result_json[: _TOOL_RESULT_MAX_CHARS_IN_CONTEXT - 60] + (
+        f' …[truncated; full result was {len(result_json)} chars]"}}'
+    )
+
+
 def run_agent(
     user_query: str,
     *,
@@ -99,89 +130,119 @@ def run_agent(
     model: str | None = None,
 ) -> str:
     """Execute the agent loop for one user query. Returns the final
-    assistant text. `on_event` (optional) receives observability events
-    for the CLI to surface — kinds are 'tool_call', 'tool_result',
-    'iteration', 'final'.
+    assistant text. Writes one JSONL trace file per call to `traces/`.
 
-    The conversation lives in memory only; nothing is persisted by the
-    agent itself. Auditing the agent's own calls is a sitting-3 concern.
+    `on_event` (optional) receives interactive events for the CLI to
+    print. Kinds: `trace_started`, `iteration`, `tool_call`,
+    `tool_result`, `final`.
     """
     client = _make_client()
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_query},
     ]
-    tools = [LOG_SEARCH_SCHEMA, HMAC_VERIFY_SCHEMA]
+    tools = [
+        LOG_SEARCH_SCHEMA,
+        TIME_RANGE_QUERY_SCHEMA,
+        HMAC_VERIFY_SCHEMA,
+        SUMMARY_STATS_SCHEMA,
+    ]
     model = model or ENV_MODEL or DEFAULT_MODEL
+    tracer = Tracer.start(user_query)
+    if on_event:
+        on_event("trace_started", {"path": str(tracer.path)})
 
-    for iteration in range(1, MAX_ITERATIONS + 1):
-        if on_event:
-            on_event("iteration", {"n": iteration})
-
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=tools,
-            tool_choice="auto",
-        )
-        msg = response.choices[0].message
-
-        # No tool calls → we have our final answer
-        if not getattr(msg, "tool_calls", None):
-            text = msg.content or ""
+    try:
+        for iteration in range(1, MAX_ITERATIONS + 1):
             if on_event:
-                on_event("final", {"text": text, "iterations": iteration})
-            return text
+                on_event("iteration", {"n": iteration})
 
-        # Append the assistant's tool-call message verbatim (the OpenAI
-        # protocol requires the same `tool_calls` block be present in
-        # the conversation history before the corresponding tool roles).
-        messages.append({
-            "role": "assistant",
-            "content": msg.content or "",
-            "tool_calls": [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                }
-                for tc in msg.tool_calls
-            ],
-        })
+            # ── Model call (timed) ──────────────────────────────
+            t0 = time.perf_counter()
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice="auto",
+                )
+            except Exception as exc:
+                tracer.error(iteration=iteration, where="model_call", exc=exc)
+                raise
+            model_latency_ms = int((time.perf_counter() - t0) * 1000)
+            tracer.model_call(
+                iteration=iteration, model=model,
+                messages_count=len(messages), latency_ms=model_latency_ms,
+            )
+            msg = response.choices[0].message
 
-        for tc in msg.tool_calls:
-            name = tc.function.name
-            args_raw = tc.function.arguments
-            if on_event:
-                on_event("tool_call", {"name": name, "args_raw": args_raw, "id": tc.id})
+            # No tool calls → final answer
+            if not getattr(msg, "tool_calls", None):
+                text = msg.content or ""
+                tracer.final_answer(content=text, total_iterations=iteration)
+                if on_event:
+                    on_event("final", {"text": text, "iterations": iteration})
+                return text
 
-            result_json = _dispatch(name, args_raw, AVAILABLE_TOOLS)
-            if on_event:
-                # Decode for the CLI to pretty-print; the wire format
-                # stays JSON-stringified.
+            # Append the assistant's tool-call message verbatim.
+            messages.append({
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in msg.tool_calls
+                ],
+            })
+
+            for tc in msg.tool_calls:
+                name = tc.function.name
+                args_raw = tc.function.arguments
+                try:
+                    args_decoded = json.loads(args_raw) if args_raw else {}
+                except json.JSONDecodeError:
+                    args_decoded = {"_unparsed": args_raw}
+                if on_event:
+                    on_event("tool_call", {"name": name, "args_raw": args_raw, "id": tc.id})
+
+                # ── Tool dispatch (timed) ──────────────────────
+                t1 = time.perf_counter()
+                result_json = _dispatch(name, args_raw, AVAILABLE_TOOLS)
+                tool_latency_ms = int((time.perf_counter() - t1) * 1000)
                 try:
                     decoded = json.loads(result_json)
                 except json.JSONDecodeError:
                     decoded = result_json
-                on_event("tool_result", {"name": name, "id": tc.id, "result": decoded})
 
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": result_json,
-            })
+                tracer.tool_call(iteration=iteration, tool=name,
+                                 args=args_decoded, latency_ms=tool_latency_ms)
+                tracer.tool_result(iteration=iteration, tool=name, result=decoded)
 
-    # Iteration cap reached — return whatever the last assistant message
-    # carried as content, even if empty, with a diagnostic prefix so the
-    # CLI surfaces the runaway condition rather than silently hiding it.
-    last_text = messages[-1].get("content", "") if messages else ""
-    diag = f"[agent: hit MAX_ITERATIONS={MAX_ITERATIONS} without settling]"
-    if on_event:
-        on_event("final", {"text": last_text, "iterations": MAX_ITERATIONS, "capped": True})
-    return f"{diag}\n{last_text}"
+                if on_event:
+                    on_event("tool_result", {"name": name, "id": tc.id, "result": decoded})
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": _truncate_for_context(result_json),
+                })
+
+        # Iteration cap — return what we have with a diagnostic prefix.
+        last_text = messages[-1].get("content", "") if messages else ""
+        diag = f"[agent: hit MAX_ITERATIONS={MAX_ITERATIONS} without settling]"
+        capped_answer = f"{diag}\n{last_text}"
+        tracer.final_answer(content=capped_answer, total_iterations=MAX_ITERATIONS)
+        if on_event:
+            on_event("final", {"text": last_text, "iterations": MAX_ITERATIONS, "capped": True})
+        return capped_answer
+    finally:
+        tracer.close()
 
 
 # ── Module-CLI: run as `python agent.py "<query>"` for quick checks ──

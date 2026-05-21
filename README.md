@@ -33,7 +33,57 @@ Adds `hmac_verify` — recomputes LocallyAI's `_chain_hmac` chain
 and returns `{chain_intact, verified_count, total_count,
 first_failure_seq, failures[]}`. With both tools the agent can
 investigate audit-log **content** (sitting 1) AND verify
-**chain integrity** (sitting 2). See the **Demo** section below.
+**chain integrity** (sitting 2).
+
+## Sitting 3 scope
+
+Fills out the tool surface to four and instruments the agent
+loop with per-run JSONL tracing.
+
+### The four tools
+
+| Tool | Use for | Returns |
+|---|---|---|
+| `log_search(query, max_results)` | Keyword / substring content matching across metadata fields | Up to `max_results` entries, newest-first |
+| `time_range_query(start, end, event_type, user, max_results)` | Precise ISO-8601 time window + structured filters (chat vs admin, user_hash substring) | Up to `max_results` entries in the window, sorted ascending |
+| `hmac_verify(start_seq, end_seq)` | Chain integrity, tamper detection, "is this log valid" questions | `{chain_intact, verified_count, total_count, first_failure_seq, failures[≤10]}` |
+| `summary_stats(group_by, start, end)` | Counts / top-N / distributions; `group_by` ∈ {`user`, `event_type`, `hour_of_day`, `day`} | `{group_by, total_events, buckets[{key,count}], time_range}` |
+
+Routing decisions live in the tool **descriptions** (the system
+prompt is just orientation). Each tool's description explicitly
+tells the model when *not* to use it ("use `summary_stats` instead
+when the question asks for counts"). If the model passes a
+`group_by` not in the enum, `summary_stats` returns a clear error
+listing the valid options — the model self-corrects on the next
+iteration rather than getting a silent default.
+
+### Tracing
+
+Every `run_agent()` call writes one JSONL file to `traces/`
+(gitignored). One line per event:
+
+| Event | Fields |
+|---|---|
+| `user_query` | `content`, `timestamp` |
+| `model_call` | `iteration`, `model`, `messages_count`, `latency_ms` |
+| `tool_call` | `iteration`, `tool`, `args`, `latency_ms` |
+| `tool_result` | `iteration`, `tool`, `result_summary` (capped 500 chars) |
+| `error` | `iteration`, `where` (`model_call` \| `tool_call`), `exception`, `message` |
+| `final_answer` | `content`, `total_iterations`, `total_latency_ms` |
+
+Latencies use `time.perf_counter()`. Tool results are truncated to
+500 chars in the trace and to 1500 chars when fed back into the
+next model call — bounds the context against tool-chaining bloat.
+
+`trace_viewer.py` renders any trace human-readably:
+
+```bash
+python trace_viewer.py traces/<file>.jsonl     # specific file
+python trace_viewer.py traces/                 # picks the newest
+python trace_viewer.py - < trace.jsonl         # stdin pipe
+```
+
+The traces directory is the eval-suite input for sitting 4.
 
 ## Demo
 
@@ -49,11 +99,35 @@ export LOCALLYAI_AUDIT_LOG=/path/to/locallyai/logs/audit.log
 python cli.py
 ```
 
-| Query | Expected tools | Observed (sitting-2 run) |
+| Query | Expected tools | Observed (sitting-3 run) |
 |---|---|---|
-| **Q1 — content** "Find all admin authentication events from the last 24 hours." | `log_search` only | ✓ `log_search(query='admin', max_results=500)` |
-| **Q2 — integrity** "Is the audit log chain intact for the last 1000 entries?" | `hmac_verify` only | ✓ `hmac_verify(end_seq=1000)` → `chain INTACT verified=10/10` |
-| **Q3 — mixed** "Did anyone access privileged documents outside business hours, and is that part of the log tamper-free?" | both tools | ✓ `log_search(query='privileged documents non-business hours')` + `hmac_verify()` parallelised in one iteration |
+| **Q1 — content** "Find all admin authentication events from the last 24 hours." | `log_search` or `time_range_query` (both reasonable readings) | ✓ `time_range_query(start='2026-05-21T00:00:00Z', end='2026-05-21T23:59:59Z', event_type='admin')` |
+| **Q2 — integrity** "Is the audit log chain intact for the last 1000 entries?" | `hmac_verify` only | ✓ `hmac_verify(start_seq=1, end_seq=1000)` → `chain INTACT verified=10/10` |
+| **Q3 — mixed** "Did anyone access privileged documents outside business hours, and is that part of the log tamper-free?" | both tools | ✓ `time_range_query(...)` + `hmac_verify(...)` parallelised in one iteration |
+| **Q4 — time range** "How many failed login attempts happened between 9am and 5pm yesterday?" | `time_range_query` (possibly chained with `summary_stats`) | ✓ `time_range_query(start='...T09:00:00Z', end='...T17:00:00Z', event_type='non_chat')` |
+| **Q5 — aggregation** "Which three users had the most admin actions this week?" | `summary_stats(group_by='user', ...)` | ✓ `summary_stats(group_by='user')` → `{8bcc65a8…: 10}` (the test corpus has one operator) |
+
+### Sample trace
+
+```
+=== trace: traces/2026-05-21T190410Z_a91a290b.jsonl ===
+  [2026-05-21T19:04:10Z] user_query: 'Which three users had the most admin actions this week?'
+
+  --- iteration 1 ---
+    model_call    model=qwen2.5-coder-7b-instruct-mlx  messages=2  latency_ms=3111
+    tool_call     summary_stats(group_by='user')  latency_ms=2
+    tool_result   summary_stats → {"group_by": "user", "total_events": 10, "buckets": [{"key": "8bcc65a8fac92c0f", "count": 10}], ...}
+
+  --- iteration 2 ---
+    model_call    model=qwen2.5-coder-7b-instruct-mlx  messages=4  latency_ms=3436
+
+  === final_answer  iterations=2  total_latency_ms=6551 ===
+  Based on the provided summary statistics, there was only one user
+  (identified by the hash prefix `8bcc65a8fac92c0f`) who had any
+  admin actions during the specified time range. ...
+
+  summary: 2 model calls (6547 ms), 1 tool calls (2 ms)
+```
 
 ### Tampering smoke test
 
@@ -164,8 +238,25 @@ each tool result, and the final answer.
 
 - ~~**Sitting 1** — `log_search` + the OpenAI-shaped agent loop.~~ ✓ shipped
 - ~~**Sitting 2** — `hmac_verify` + system-prompt tool-routing + tamper-detection smoke test.~~ ✓ shipped
-- **Sitting 3** — `time_range_query`, `summary_stats`; 30-question eval suite. Also: swap to Qwen 2.5 14B Instruct once a working build is available, run the eval to quantify the routing-quality / answer-quality delta vs Coder 7B.
-- **Sitting 4** — FastAPI server + per-firm deployment as a `/admin/forensics/ask` endpoint behind `_admin_auth`.
+- ~~**Sitting 3** — `time_range_query`, `summary_stats`, per-run JSONL tracing + `trace_viewer.py`.~~ ✓ shipped
+- **Sitting 4** — 30-question eval suite (the traces from sitting 3 are the input). Model swap to Qwen 2.5 14B Instruct once a working build is available; quantify the routing-quality / answer-quality delta vs Coder 7B on the eval.
+- **Sitting 5** — FastAPI server + per-firm deployment as a `/admin/forensics/ask` endpoint behind `_admin_auth`.
+
+## Known drift risk
+
+`tools.py` re-implements LocallyAI's `_chain_hmac` walk (sitting 2)
+and `_iter_entries_from` JSONL reader (sitting 1) locally rather
+than importing from LocallyAI's `api.py` / `audit_reader.py`. This
+is deliberate — the agent ships as a standalone codebase that
+doesn't need the full LocallyAI dependency tree to install — but
+if LocallyAI changes the chain algorithm (different canonicalisation,
+different HMAC msg format, different genesis convention) the
+verifier will silently return false positives or negatives.
+Mitigation: re-run the tampering smoke test against the latest
+LocallyAI archive after any LocallyAI release that touches
+`api.py:_chain_hmac` or `api.py:_write_audit`. Sitting 5 will
+introduce a thin `locallyai_adapter.py` that imports the canonical
+functions when LocallyAI is installed in the same Python env.
 
 ## License
 

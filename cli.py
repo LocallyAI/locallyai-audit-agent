@@ -34,6 +34,10 @@ QUERIES = [
     ("Q3 — mixed",
      "Did anyone access privileged documents outside business hours, "
      "and is that part of the log tamper-free?"),
+    ("Q4 — time range",
+     "How many failed login attempts happened between 9am and 5pm yesterday?"),
+    ("Q5 — aggregation",
+     "Which three users had the most admin actions this week?"),
 ]
 
 
@@ -59,7 +63,9 @@ def _format_failure(f: dict) -> str:
 
 
 def _emit(kind: str, payload: dict[str, Any]) -> None:
-    if kind == "iteration":
+    if kind == "trace_started":
+        print(f"[Trace] Writing to {payload['path']}")
+    elif kind == "iteration":
         print(f"\n[Agent] Iteration {payload['n']}")
     elif kind == "tool_call":
         name = payload["name"]
@@ -82,6 +88,31 @@ def _emit(kind: str, payload: dict[str, Any]) -> None:
                 print(_format_log_entry(e))
             if suffix:
                 print(f"  {suffix.strip()}")
+        elif name == "time_range_query" and isinstance(result, list):
+            # The tool returns a single-element list with an error dict
+            # when the timestamps are bad; render that distinctly.
+            if result and isinstance(result[0], dict) and "error" in result[0]:
+                print(f"[Tool ] time_range_query → ERROR: {result[0]}")
+            else:
+                head, suffix = _truncate(result, head=3)
+                print(f"[Tool ] time_range_query → {len(result)} entries:")
+                for e in head:
+                    print(_format_log_entry(e))
+                if suffix:
+                    print(f"  {suffix.strip()}")
+        elif name == "summary_stats" and isinstance(result, dict):
+            if "error" in result:
+                print(f"[Tool ] summary_stats → ERROR: {result['error']}: "
+                      f"{result.get('detail','')[:200]}")
+            else:
+                buckets = result.get("buckets", [])
+                print(f"[Tool ] summary_stats(group_by={result.get('group_by')}) → "
+                      f"{result.get('total_events',0)} events across "
+                      f"{len(buckets)} buckets")
+                for b in buckets[:5]:
+                    print(f"  - {b['key']}: {b['count']}")
+                if len(buckets) > 5:
+                    print(f"  ... [+{len(buckets) - 5} more buckets]")
         elif name == "hmac_verify" and isinstance(result, dict):
             v = result
             ok = "INTACT" if v.get("chain_intact") else "BROKEN"
@@ -106,7 +137,7 @@ def _emit(kind: str, payload: dict[str, Any]) -> None:
 def main() -> int:
     log_path = _resolve_log_path()
     print("=" * 70)
-    print("=== locallyai-audit-agent — sitting 2 ===")
+    print("=== locallyai-audit-agent — sitting 3 ===")
     print(f"  Audit log:   {log_path}  (exists={log_path.exists()})")
     print(f"  Base URL:    {os.getenv('BASE_URL', 'http://localhost:11434/v1')}")
     print(f"  Model:       {os.getenv('MODEL', 'qwen2.5:14b')}")

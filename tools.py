@@ -1,23 +1,36 @@
 """
-tools.py — agent-callable tools, sitting 1.
+tools.py — agent-callable tools.
 
-Only `log_search` is implemented tonight. Schema + dispatch table
-are exposed for the agent loop.
+Four tools as of sitting 3:
+    log_search          — keyword/substring match across metadata fields
+    hmac_verify         — HMAC chain-integrity walk (sitting 2)
+    time_range_query    — precise ISO-timestamp window + structured filters
+    summary_stats       — aggregations bucketed by a fixed enum
 
 The reader is intentionally minimal and does NOT import LocallyAI —
-that keeps the agent loose-coupled to the audit-log format and
-makes this codebase shippable into firms whose LocallyAI checkout
-isn't on the same machine. The format is JSONL (one JSON object
-per line) with optional gzip-compressed rotations alongside the
-active file. Refactor toward the real `audit_reader.py` shape in
-sitting 2 once we know what the agent actually needs.
+that keeps the agent loose-coupled to the audit-log format and makes
+this codebase shippable into firms whose LocallyAI checkout isn't on
+the same machine. The format is JSONL (one JSON object per line) with
+optional gzip-compressed rotations alongside the active file.
+
+LocallyAI audit-log schema (12 fields + `_chain_hmac`):
+    timestamp node_id data_region user_hash salt_era model sources
+    latency_ms backend query_hash matter_code _chain_hmac
+There is NO `event_type` column. This module maps the spec-level
+concept of "event type" onto the real `model` field: entries with
+`model == "-"` are non-chat administrative events (user CRUD, ACL
+edits, conflict checks, etc.); entries with `model != "-"` are chat
+completions. The tool descriptions surface this so the model routes
+correctly.
 """
 from __future__ import annotations
 
+import datetime
 import gzip
 import hmac as _hmac
 import json
 import os
+from collections import Counter
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Iterable
@@ -417,9 +430,261 @@ HMAC_VERIFY_SCHEMA = {
 }
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# time_range_query — precise structured filtering by timestamp + fields
+# ─────────────────────────────────────────────────────────────────────────
+#
+# Distinct from log_search by design: log_search is a free-text
+# substring scan, time_range_query is a structured filter. The
+# different tool descriptions are what route the model correctly.
+
+
+def _parse_iso(ts: str) -> datetime.datetime | None:
+    """Parse an ISO-8601 timestamp tolerating trailing `Z`. Returns None
+    on parse failure (caller decides whether to error or skip)."""
+    if not ts:
+        return None
+    s = ts.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt
+
+
+def time_range_query(
+    start: str,
+    end: str,
+    event_type: str | None = None,
+    user: str | None = None,
+    max_results: int = 50,
+) -> list[dict[str, Any]]:
+    """Return audit entries with `start <= timestamp <= end`, optionally
+    filtered by event_type / user. Sorted ascending by timestamp.
+
+    Args:
+        start, end: ISO-8601 timestamps (e.g. `2026-05-20T14:00:00Z`).
+        event_type: one of `chat` (entries with model != "-"),
+            `non_chat` / `admin` (entries with model == "-"), or a
+            substring matched case-insensitively against the `model`
+            field (so `event_type="mlx-community/Qwen"` works).
+        user: substring matched case-insensitively against `user_hash`.
+            (The audit log pseudonymises usernames; pass the hash
+            prefix, not the plain-text name.)
+        max_results: cap on entries returned (default 50, max 500).
+    """
+    if not isinstance(max_results, int) or max_results < 1:
+        max_results = 50
+    if max_results > 500:
+        max_results = 500
+
+    start_dt = _parse_iso(start)
+    end_dt = _parse_iso(end)
+    if start_dt is None or end_dt is None:
+        return [{
+            "error": "invalid_timestamp",
+            "detail": f"start={start!r} end={end!r} — expected ISO-8601 (e.g. '2026-05-20T14:00:00Z').",
+        }]
+    if end_dt < start_dt:
+        return [{"error": "invalid_range", "detail": f"end ({end}) precedes start ({start})."}]
+
+    et = (event_type or "").strip().lower()
+    user_needle = (user or "").strip().lower()
+
+    active = _resolve_log_path()
+    files = _candidate_files(active)
+    matches: list[tuple[datetime.datetime, dict[str, Any]]] = []
+    for f in files:
+        for entry in _iter_entries_from(f):
+            ts_dt = _parse_iso(entry.get("timestamp", ""))
+            if ts_dt is None or ts_dt < start_dt or ts_dt > end_dt:
+                continue
+            if et:
+                model = (entry.get("model") or "").strip()
+                if et in ("chat",):
+                    if model == "-" or not model:
+                        continue
+                elif et in ("non_chat", "non-chat", "admin"):
+                    if model and model != "-":
+                        continue
+                else:
+                    # Free-text substring match against the model field.
+                    if et not in model.lower():
+                        continue
+            if user_needle:
+                if user_needle not in (entry.get("user_hash") or "").lower():
+                    continue
+            matches.append((ts_dt, entry))
+
+    matches.sort(key=lambda t: t[0])           # ascending by timestamp
+    return [m[1] for m in matches[:max_results]]
+
+
+TIME_RANGE_QUERY_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "time_range_query",
+        "description": (
+            "Return audit-log entries whose `timestamp` falls inside a "
+            "precise ISO-8601 window, optionally narrowed by event_type "
+            "and user. USE THIS TOOL when the question carries a "
+            "time window or a structured filter ('between 9 and 5', "
+            "'yesterday', 'last week', 'all chat events on 2026-05-15'). "
+            "Use `log_search` instead for free-text keyword matching "
+            "with no time constraint. Use `summary_stats` instead when "
+            "the question asks for counts or aggregations rather than "
+            "individual entries.\n"
+            "event_type values:\n"
+            "  - `chat`     — entries with model != '-' (chat completions)\n"
+            "  - `non_chat` / `admin` — entries with model == '-' "
+            "(user CRUD, ACL edits, conflict checks, document compare)\n"
+            "  - any other string — substring-matched against `model`\n"
+            "user must be a substring of `user_hash` (the audit log "
+            "pseudonymises usernames; pass the hash prefix, not the "
+            "plain-text name)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "start": {"type": "string", "description": "ISO-8601 start (inclusive), e.g. '2026-05-20T09:00:00Z'."},
+                "end":   {"type": "string", "description": "ISO-8601 end (inclusive), e.g. '2026-05-20T17:00:00Z'."},
+                "event_type": {"type": "string", "description": "Optional. `chat` | `non_chat` | `admin` | substring of model."},
+                "user":  {"type": "string", "description": "Optional. Substring of `user_hash`."},
+                "max_results": {"type": "integer", "default": 50, "minimum": 1, "maximum": 500},
+            },
+            "required": ["start", "end"],
+        },
+    },
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# summary_stats — aggregations on a fixed enum (NOT a query language)
+# ─────────────────────────────────────────────────────────────────────────
+
+_VALID_GROUP_BY = ("user", "event_type", "hour_of_day", "day")
+
+
+def summary_stats(
+    group_by: str,
+    start: str | None = None,
+    end: str | None = None,
+) -> dict[str, Any]:
+    """Bucket audit entries by one of a fixed set of dimensions and
+    return per-bucket counts sorted descending.
+
+    Args:
+        group_by: one of `user`, `event_type`, `hour_of_day`, `day`.
+            ANY other value returns an explicit error — the model is
+            expected to self-correct on the next iteration. We do NOT
+            silently coerce to a default.
+        start, end: optional ISO-8601 time window. Both inclusive.
+
+    Return shape:
+        {
+          "group_by":     str,
+          "total_events": int,
+          "buckets":      [{"key": str, "count": int}, ...],
+          "time_range":   {"start": str | None, "end": str | None},
+        }
+    """
+    gb = (group_by or "").strip().lower()
+    if gb not in _VALID_GROUP_BY:
+        return {
+            "error": "invalid_group_by",
+            "detail": (f"group_by={group_by!r} is not supported. "
+                       f"Valid values: {list(_VALID_GROUP_BY)}."),
+            "valid_group_by": list(_VALID_GROUP_BY),
+        }
+
+    start_dt = _parse_iso(start) if start else None
+    end_dt = _parse_iso(end) if end else None
+    if start and start_dt is None:
+        return {"error": "invalid_timestamp", "detail": f"start={start!r} — expected ISO-8601."}
+    if end and end_dt is None:
+        return {"error": "invalid_timestamp", "detail": f"end={end!r} — expected ISO-8601."}
+
+    active = _resolve_log_path()
+    files = _candidate_files(active)
+    counter: Counter[str] = Counter()
+    total = 0
+    for f in files:
+        for entry in _iter_entries_from(f):
+            ts_dt = _parse_iso(entry.get("timestamp", ""))
+            if ts_dt is None:
+                continue
+            if start_dt and ts_dt < start_dt:
+                continue
+            if end_dt and ts_dt > end_dt:
+                continue
+            total += 1
+            if gb == "user":
+                key = (entry.get("user_hash") or "")[:16] or "(no user_hash)"
+            elif gb == "event_type":
+                model = (entry.get("model") or "").strip()
+                key = "non_chat" if (model == "-" or not model) else "chat"
+            elif gb == "hour_of_day":
+                key = f"{ts_dt.hour:02d}"
+            elif gb == "day":
+                key = ts_dt.date().isoformat()
+            else:                                        # pragma: no cover
+                key = "(unreachable)"
+            counter[key] += 1
+
+    buckets = [{"key": k, "count": c} for k, c in counter.most_common()]
+    return {
+        "group_by":     gb,
+        "total_events": total,
+        "buckets":      buckets,
+        "time_range":   {"start": start, "end": end},
+    }
+
+
+SUMMARY_STATS_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "summary_stats",
+        "description": (
+            "Aggregate the audit log into per-bucket counts, sorted "
+            "desc by count. USE THIS TOOL for any question asking "
+            "'how many', 'top N', 'distribution', 'breakdown', "
+            "'busiest hour', or 'which users had the most ...'. "
+            "Use `time_range_query` or `log_search` instead when the "
+            "question asks for individual entries rather than counts.\n"
+            "group_by is a fixed enum (any other value is an error):\n"
+            "  - `user`        — count per `user_hash` prefix\n"
+            "  - `event_type`  — `chat` vs `non_chat` (model is '-')\n"
+            "  - `hour_of_day` — bucketed 00..23 from timestamp\n"
+            "  - `day`         — bucketed by calendar date\n"
+            "Pass start + end as ISO-8601 timestamps to narrow the "
+            "time window."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "group_by": {
+                    "type": "string",
+                    "enum": list(_VALID_GROUP_BY),
+                    "description": "Dimension to bucket by.",
+                },
+                "start": {"type": "string", "description": "Optional ISO-8601 start (inclusive)."},
+                "end":   {"type": "string", "description": "Optional ISO-8601 end (inclusive)."},
+            },
+            "required": ["group_by"],
+        },
+    },
+}
+
+
 # ── Dispatch table for the agent loop ────────────────────────────────────
 
 AVAILABLE_TOOLS = {
-    "log_search":  log_search,
-    "hmac_verify": hmac_verify,
+    "log_search":       log_search,
+    "hmac_verify":      hmac_verify,
+    "time_range_query": time_range_query,
+    "summary_stats":    summary_stats,
 }
