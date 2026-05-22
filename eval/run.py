@@ -44,7 +44,7 @@ import os
 import sys
 import time
 import traceback
-from collections import Counter, defaultdict
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -57,8 +57,10 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from agent import run_agent
-from eval.fixtures import build as build_fixtures, fixture_log_path
-from eval.judge import JudgeNotConfigured, grade as judge_grade
+from eval.fixtures import build as build_fixtures
+from eval.fixtures import fixture_log_path
+from eval.judge import JudgeNotConfigured
+from eval.judge import grade as judge_grade
 
 EVAL_DIR = Path(__file__).resolve().parent
 RUNS_DIR = EVAL_DIR / "runs"
@@ -162,7 +164,7 @@ def _emit_summary(
     lines.append(f"- **Agent base URL:** `{base_url}`")
     lines.append(f"- **Agent model:** `{model}`")
     if judge_skipped:
-        lines.append(f"- **Judge:** SKIPPED (--no-judge)")
+        lines.append("- **Judge:** SKIPPED (--no-judge)")
     else:
         lines.append(f"- **Judge:** `{results[0]['judge'].get('judge_model','?')}` (Claude, cloud, dev-only)")
     lines.append(f"- **Fixture tamper:** seq={fixture_record.get('tampered_seq')} field={fixture_record.get('tampered_field')}")
@@ -265,7 +267,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     dataset_path = Path(args.dataset)
-    with open(dataset_path, "r", encoding="utf-8") as f:
+    with open(dataset_path, encoding="utf-8") as f:
         dataset = yaml.safe_load(f)
     if args.limit is not None:
         dataset = dataset[: args.limit]
@@ -290,7 +292,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[fixtures] tamper @ seq={fixture_record['tampered_seq']} in {fixture_record['tampered_file']}")
 
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    started_at = datetime.datetime.now(datetime.timezone.utc)
+    started_at = datetime.datetime.now(datetime.UTC)
     stamp = started_at.strftime("%Y-%m-%dT%H%M%SZ")
     if args.resume_into:
         jsonl_path = Path(args.resume_into)

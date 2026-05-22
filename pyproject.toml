@@ -1,0 +1,27 @@
+# Only ruff + pytest config lives here. No [project] section — the
+# audit agent ships as a runnable repo, not a pip-installable package.
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [
+    ".venv",
+    "traces",
+    "eval/fixtures",
+    "eval/runs",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = [
+    "E501",   # line-length already set to 100; the few over-runners are fine
+    "B008",   # function-call defaults (mirrors LocallyAI's posture, even though we don't use FastAPI here)
+    "E402",   # module-level imports after `sys.path.insert(0, _REPO_ROOT)` in eval/run.py — load-bearing and intentional
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501", "F401", "F841"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths  = ["tests"]

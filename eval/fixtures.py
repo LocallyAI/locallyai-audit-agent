@@ -81,7 +81,7 @@ def _iter_lines(path: Path):
             for line in f:
                 yield line.rstrip("\n")
     else:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             for line in f:
                 yield line.rstrip("\n")
 

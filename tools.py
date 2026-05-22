@@ -31,10 +31,10 @@ import hmac as _hmac
 import json
 import os
 from collections import Counter
+from collections.abc import Iterable
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Iterable
-
+from typing import Any
 
 # ── Configuration ─────────────────────────────────────────────────────────
 
@@ -74,7 +74,7 @@ def _open_jsonl(path: Path):
     `path`, transparently handling .gz rotation files."""
     if path.suffix == ".gz":
         return gzip.open(path, "rt", encoding="utf-8")
-    return open(path, "r", encoding="utf-8")
+    return open(path, encoding="utf-8")
 
 
 def _iter_entries_from(path: Path) -> Iterable[dict[str, Any]]:
@@ -265,7 +265,7 @@ def _load_hmac_key() -> bytes:
 def _expected_chain_hmac(entry_without_field: dict, prev: str, key: bytes) -> str:
     """Vendored from LocallyAI api.py:_chain_hmac. Returns hex digest."""
     entry_json = json.dumps(entry_without_field, sort_keys=True)
-    return _hmac.new(key, f"{prev}{entry_json}".encode("utf-8"), sha256).hexdigest()
+    return _hmac.new(key, f"{prev}{entry_json}".encode(), sha256).hexdigest()
 
 
 def _iter_log_entries_with_seq(active: Path) -> Iterable[tuple[int, dict[str, Any]]]:
@@ -452,7 +452,7 @@ def _parse_iso(ts: str) -> datetime.datetime | None:
     except ValueError:
         return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=datetime.timezone.utc)
+        dt = dt.replace(tzinfo=datetime.UTC)
     return dt
 
 

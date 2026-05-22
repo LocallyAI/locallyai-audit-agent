@@ -28,7 +28,8 @@ import json
 import os
 import sys
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from openai import OpenAI
 
@@ -40,7 +41,6 @@ from tools import (
     TIME_RANGE_QUERY_SCHEMA,
 )
 from tracing import Tracer
-
 
 # ── Configuration ─────────────────────────────────────────────────────────
 

@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 
 def _resolve_path(arg: str) -> Path | None:
@@ -113,7 +114,7 @@ def main(argv: list[str]) -> int:
     path = _resolve_path(arg)
     if path is None:
         return 1
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         _render(_iter_events(f), origin=str(path))
     return 0
 

@@ -1,0 +1,9 @@
+# locallyai-audit-agent — runtime dependencies.
+#
+# Pure-Python, four packages, no native compile. The judge dep
+# (anthropic) is dev-only — see README "Eval suite" section.
+
+openai>=1.50.0,<3.0.0       # OpenAI-compatible client (LM Studio / Ollama / mlx_lm.server)
+pydantic>=2.6.0,<3.0.0       # schemas in later sittings; light dep
+pyyaml>=6.0,<7.0             # eval/dataset.yaml
+anthropic>=0.40.0,<1.0.0     # Claude judge (DEV-ONLY — never invoked in runtime)

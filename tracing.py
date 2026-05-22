@@ -35,7 +35,7 @@ _TRACE_RESULT_TRUNCATE = 500   # chars per tool result going into the trace
 
 
 def _now_iso() -> str:
-    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _summarise_result(result: Any) -> str:
@@ -67,7 +67,7 @@ class Tracer:
         self._started_at = started_at
 
     @classmethod
-    def start(cls, query: str, trace_dir: Path | None = None) -> "Tracer":
+    def start(cls, query: str, trace_dir: Path | None = None) -> Tracer:
         d = trace_dir or Path(os.environ.get("LOCALLYAI_TRACE_DIR", "traces"))
         d.mkdir(parents=True, exist_ok=True)
         stamp = _now_iso().replace(":", "")

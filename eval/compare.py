@@ -29,7 +29,7 @@ from typing import Any
 
 def _load(path: Path) -> dict[str, dict[str, Any]]:
     rows: dict[str, dict[str, Any]] = {}
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -107,7 +107,7 @@ def main(argv: list[str] | None = None) -> int:
     only_base_ungraded = [q for q in common_all if not _is_graded(base[q])]
     only_new_ungraded = [q for q in common_all if _is_graded(base[q]) and not _is_graded(new[q])]
 
-    print(f"=== eval diff ===")
+    print("=== eval diff ===")
     print(f"  base: {base_path}  ({len(base)} rows)")
     print(f"  new:  {new_path}  ({len(new)} rows)")
     print(f"  shared: {len(common_all)} questions  "
@@ -181,7 +181,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print()
     print("=== overall ===")
-    print(f"  axis        base               new                delta")
+    print("  axis        base               new                delta")
     print(f"  tool        {_rate(b_tool, n):<18} {_rate(n_tool, n):<18} {_delta(n_tool, b_tool, n)}")
     print(f"  answer      {_rate(b_ans, n):<18} {_rate(n_ans, n):<18} {_delta(n_ans, b_ans, n)}")
     print(f"  both        {_rate(b_both, n):<18} {_rate(n_both, n):<18} {_delta(n_both, b_both, n)}")
