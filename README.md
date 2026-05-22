@@ -1,63 +1,180 @@
 # locallyai-audit-agent
 
-A forensic-audit agent for LocallyAI's tamper-evident HMAC-chained
-audit log. The agent runs as a tool-use loop over a local LLM,
-calling `log_search` (sitting 1) — and, in later sittings,
-`hmac_verify`, `time_range_query`, `summary_stats` — to investigate
-operator questions about who did what, when, against the firm's
-deployment.
+A forensic-investigation agent over LocallyAI's tamper-evident
+HMAC-chained audit log. The agent uses a local LLM (Qwen 2.5
+family) to interpret human questions and route them to four
+purpose-built tools: keyword search, time-windowed filtering,
+chain-integrity verification, and per-bucket aggregation.
 
-## Air-gapped by design
+This codebase ships into the same regulated-industry deployments
+LocallyAI itself serves. The agent's **runtime is fully
+air-gapped** — no calls leave the firm's hardware. The eval
+suite uses Claude as judge (cloud) but is dev-only tooling.
 
-This agent ships into the same regulated-industry deployments
-LocallyAI itself serves. It must run **without** any call to
-`api.anthropic.com`, `api.openai.com`, or any other off-premises
-inference endpoint. The implementation uses the OpenAI Python
-client throughout, but its `base_url` is pointed at a local
-Ollama (or LM Studio, or LocallyAI's own `/v1/chat/completions`)
-endpoint — same protocol shape, on-prem hardware.
+---
 
-The default model is **Qwen 2.5 14B Instruct** (Q4_K_M, 32K context).
-The Ollama tag is `qwen2.5:14b` — Ollama publishes Qwen 2.5's
-default 14B tag as the instruct-tuned variant; this matches the
-spec's `qwen2.5:14b-instruct`. Tool-use capability is native (the
-`ollama show` capabilities list includes `tools`).
+## Quick start
 
-## Sitting 1 scope
+```bash
+git clone <this repo> ~/locallyai-audit-agent       # or you already have it
+cd ~/locallyai-audit-agent
+./run.sh setup                                       # one-time
+./run.sh doctor                                      # pre-flight every dependency
+./run.sh demo                                        # 5-query CLI demo
+```
 
-One tool: `log_search`. One model: Qwen 2.5 14B. One CLI test.
+If `doctor` reports anything red or yellow, jump to
+[**Troubleshooting**](#troubleshooting) below.
 
-## Sitting 2 scope
+---
 
-Adds `hmac_verify` — recomputes LocallyAI's `_chain_hmac` chain
-and returns `{chain_intact, verified_count, total_count,
-first_failure_seq, failures[]}`. With both tools the agent can
-investigate audit-log **content** (sitting 1) AND verify
-**chain integrity** (sitting 2).
+## Table of contents
 
-## Sitting 3 scope
+1. [What you need](#what-you-need)
+2. [One-time setup](#one-time-setup)
+3. [Daily run patterns](#daily-run-patterns)
+4. [Configuration reference](#configuration-reference)
+5. [Architecture in 30 seconds](#architecture-in-30-seconds)
+6. [The four tools](#the-four-tools)
+7. [Tracing](#tracing)
+8. [Eval suite](#eval-suite)
+9. [Troubleshooting](#troubleshooting) ← the long section
+10. [Roadmap](#roadmap)
+11. [Known drift risk](#known-drift-risk)
 
-Fills out the tool surface to four and instruments the agent
-loop with per-run JSONL tracing.
+---
 
-### The four tools
+## What you need
+
+| Component | Why | How to check |
+|---|---|---|
+| **Python ≥ 3.10** | the agent + eval are pure Python | `python3 -V` |
+| **A LocallyAI checkout** with a populated audit log | the agent reads `logs/audit.log` from this path | `ls ~/locallyai/logs/audit*.log*` |
+| **LocallyAI's `.env`** with `LOCALLYAI_AUDIT_HMAC_KEY` | `hmac_verify` needs it | `grep AUDIT_HMAC_KEY ~/locallyai/.env` |
+| **LM Studio** (or Ollama) **with a tool-capable Qwen model loaded** | the agent's LLM backend | `curl -s http://localhost:1234/v1/models` |
+| **`ANTHROPIC_API_KEY`** *(eval only)* | the Claude judge | `echo $ANTHROPIC_API_KEY` |
+
+`./run.sh doctor` checks all of these in one shot and prints what
+needs fixing.
+
+---
+
+## One-time setup
+
+```bash
+cd ~/locallyai-audit-agent
+./run.sh setup            # creates .venv + installs openai pydantic pyyaml anthropic
+./run.sh doctor           # confirms python, venv, deps, .env, audit log, LM Studio
+```
+
+Then start the model backend (LM Studio is the supported default;
+Ollama works too):
+
+1. Open **LM Studio**
+2. Discover tab → search **`qwen2.5 14b instruct`** → download the GGUF or MLX build (~9 GB).  
+   If you don't have 9 GB of bandwidth right now, **`qwen2.5-coder-7b-instruct-mlx`** is the fallback used by the committed baseline.
+3. Left sidebar → **`</>`** (Developer / Local Server)
+4. Select the model in the top dropdown
+5. Toggle **Status: Running** (default port `1234`)
+
+Re-run `./run.sh doctor` — every line should be green.
+
+---
+
+## Daily run patterns
+
+| What | Command | Notes |
+|---|---|---|
+| Sanity-check everything | `./run.sh doctor` | Reads-only. Always safe. |
+| 5-query CLI demo | `./run.sh demo` | ~30 s. Prints tool calls + answers + trace paths. |
+| One ad-hoc question | `./run.sh ask "Is the chain intact?"` | Writes one trace to `traces/`. |
+| Full eval (30 questions) | `./run.sh eval` | Needs `ANTHROPIC_API_KEY`. ~10–15 min on Coder 7B. |
+| Eval without the judge | `./run.sh eval-dry` | Offline; captures agent answers, skips grading. |
+| Resume an interrupted eval | `./run.sh eval-resume eval/runs/<file>.jsonl` | Auto-detects the first ungraded question. |
+| Compare two runs | `./run.sh compare <base>.jsonl <new>.jsonl` | After a tweak, this is the only thing that tells you whether it helped. |
+| Pretty-print a trace | `./run.sh trace [<file>]` | No arg = newest trace under `traces/`. |
+
+All of the above auto-source LocallyAI's `.env`, activate the venv,
+set sensible defaults, and run preflight checks before dispatching
+to Python. To override any default for one invocation:
+
+```bash
+MODEL=qwen2.5:14b ./run.sh demo                      # different model
+BASE_URL=http://office-mac.local:1234/v1 ./run.sh eval   # remote LM Studio
+LOCALLYAI_REPO=/path/to/locallyai ./run.sh doctor    # non-default LocallyAI path
+```
+
+---
+
+## Configuration reference
+
+All env vars the agent and `run.sh` recognise.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `BASE_URL` | `http://localhost:1234/v1` | OpenAI-compatible endpoint (LM Studio, Ollama, LocallyAI). Must serve `/v1/chat/completions` with tool-call support. |
+| `MODEL` | `qwen2.5-coder-7b-instruct-mlx` | Model identifier the backend recognises. For Ollama use `qwen2.5:14b`. For LocallyAI use its current model ID (see `/v1/models`). |
+| `LOCALLYAI_REPO` | `$HOME/locallyai` | Where to find LocallyAI's `.env` + `logs/`. Override if your checkout lives elsewhere. |
+| `LOCALLYAI_ENV` | `$LOCALLYAI_REPO/.env` | Path to LocallyAI's `.env`. Auto-sourced by `run.sh`. |
+| `LOCALLYAI_AUDIT_LOG` | `$LOCALLYAI_REPO/logs/audit.log` | The active audit log. Walker also picks up sibling `audit-YYYY-MM-DD.log.gz` rotations automatically. |
+| `LOCALLYAI_AUDIT_HMAC_KEY` | (from LocallyAI's `.env`) | HMAC secret used by `hmac_verify`. Must match what LocallyAI used to write the chain or every entry looks "tampered". |
+| `LOCALLYAI_TRACE_DIR` | `traces/` (relative to cwd) | Where per-run JSONL traces are written. |
+| `ANTHROPIC_API_KEY` | (unset) | Required for `./run.sh eval`. The judge — dev-only — never sees the audit log itself. |
+| `JUDGE_MODEL` | `claude-haiku-4-5-20251001` | Override the judge model. Haiku is fine for structured grading; use Sonnet for closer calls. |
+| `LOCALLYAI_AUDIT_LOG_SOURCE` | `/Users/emanuel/locallyai/logs/audit.log` | Source log used by `eval/fixtures.py` to build the eval fixtures. Set this if you're not the original developer. |
+
+---
+
+## Architecture in 30 seconds
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  cli.py / agent.py                                           │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │ run_agent(user_query):                                 │  │
+│  │   OpenAI client → BASE_URL (LM Studio / Ollama / ...)  │  │
+│  │   loop max 5 iterations:                               │  │
+│  │     model emits tool_calls                             │  │
+│  │     dispatch via AVAILABLE_TOOLS                       │  │
+│  │     append tool result, recurse                        │  │
+│  │   no more tool_calls → return final text               │  │
+│  │   tracing.py writes one JSONL line per event           │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                          │                                   │
+│                          ▼                                   │
+│  tools.py — four tools, each a plain Python fn:              │
+│    log_search       — substring across metadata fields       │
+│    time_range_query — ISO window + event_type + user filters │
+│    hmac_verify      — chain integrity walk (vendored from    │
+│                       LocallyAI api.py:_chain_hmac)          │
+│    summary_stats    — counts bucketed by fixed enum          │
+└──────────────────────────────────────────────────────────────┘
+            │ reads
+            ▼
+   /path/to/locallyai/logs/audit.log + sibling .gz rotations
+```
+
+---
+
+## The four tools
 
 | Tool | Use for | Returns |
 |---|---|---|
 | `log_search(query, max_results)` | Keyword / substring content matching across metadata fields | Up to `max_results` entries, newest-first |
 | `time_range_query(start, end, event_type, user, max_results)` | Precise ISO-8601 time window + structured filters (chat vs admin, user_hash substring) | Up to `max_results` entries in the window, sorted ascending |
-| `hmac_verify(start_seq, end_seq)` | Chain integrity, tamper detection, "is this log valid" questions | `{chain_intact, verified_count, total_count, first_failure_seq, failures[≤10]}` |
+| `hmac_verify(start_seq, end_seq)` | Chain integrity, tamper detection | `{chain_intact, verified_count, total_count, first_failure_seq, failures[≤10]}` |
 | `summary_stats(group_by, start, end)` | Counts / top-N / distributions; `group_by` ∈ {`user`, `event_type`, `hour_of_day`, `day`} | `{group_by, total_events, buckets[{key,count}], time_range}` |
 
-Routing decisions live in the tool **descriptions** (the system
-prompt is just orientation). Each tool's description explicitly
-tells the model when *not* to use it ("use `summary_stats` instead
-when the question asks for counts"). If the model passes a
-`group_by` not in the enum, `summary_stats` returns a clear error
-listing the valid options — the model self-corrects on the next
-iteration rather than getting a silent default.
+Routing decisions live in the **tool descriptions** themselves
+(see `tools.py`). Each tool's description explicitly tells the
+model when *not* to use it. Bad `group_by` values to `summary_stats`
+return a clear error listing the valid options — the model
+self-corrects on the next iteration rather than getting a silent
+default.
 
-### Tracing
+---
+
+## Tracing
 
 Every `run_agent()` call writes one JSONL file to `traces/`
 (gitignored). One line per event:
@@ -71,245 +188,72 @@ Every `run_agent()` call writes one JSONL file to `traces/`
 | `error` | `iteration`, `where` (`model_call` \| `tool_call`), `exception`, `message` |
 | `final_answer` | `content`, `total_iterations`, `total_latency_ms` |
 
-Latencies use `time.perf_counter()`. Tool results are truncated to
-500 chars in the trace and to 1500 chars when fed back into the
-next model call — bounds the context against tool-chaining bloat.
-
-`trace_viewer.py` renders any trace human-readably:
+Render any trace human-readably:
 
 ```bash
-python trace_viewer.py traces/<file>.jsonl     # specific file
-python trace_viewer.py traces/                 # picks the newest
-python trace_viewer.py - < trace.jsonl         # stdin pipe
+./run.sh trace                            # newest
+./run.sh trace traces/<file>.jsonl        # specific
+python trace_viewer.py - < trace.jsonl    # stdin pipe
 ```
 
-The traces directory is the eval-suite input for sitting 4.
+Tool results are truncated to 500 chars in the trace and to 1500
+chars when fed back into the next model call — bounds the context
+against tool-chaining bloat.
 
-## Demo
-
-The CLI runs three sequential queries against the LocallyAI audit
-log to exercise tool routing:
-
-```bash
-cd ~/locallyai-audit-agent && source .venv/bin/activate
-set -a; source /path/to/locallyai/.env; set +a       # for LOCALLYAI_AUDIT_HMAC_KEY
-export BASE_URL=http://localhost:1234/v1             # LM Studio
-export MODEL=qwen2.5-coder-7b-instruct-mlx
-export LOCALLYAI_AUDIT_LOG=/path/to/locallyai/logs/audit.log
-python cli.py
-```
-
-| Query | Expected tools | Observed (sitting-3 run) |
-|---|---|---|
-| **Q1 — content** "Find all admin authentication events from the last 24 hours." | `log_search` or `time_range_query` (both reasonable readings) | ✓ `time_range_query(start='2026-05-21T00:00:00Z', end='2026-05-21T23:59:59Z', event_type='admin')` |
-| **Q2 — integrity** "Is the audit log chain intact for the last 1000 entries?" | `hmac_verify` only | ✓ `hmac_verify(start_seq=1, end_seq=1000)` → `chain INTACT verified=10/10` |
-| **Q3 — mixed** "Did anyone access privileged documents outside business hours, and is that part of the log tamper-free?" | both tools | ✓ `time_range_query(...)` + `hmac_verify(...)` parallelised in one iteration |
-| **Q4 — time range** "How many failed login attempts happened between 9am and 5pm yesterday?" | `time_range_query` (possibly chained with `summary_stats`) | ✓ `time_range_query(start='...T09:00:00Z', end='...T17:00:00Z', event_type='non_chat')` |
-| **Q5 — aggregation** "Which three users had the most admin actions this week?" | `summary_stats(group_by='user', ...)` | ✓ `summary_stats(group_by='user')` → `{8bcc65a8…: 10}` (the test corpus has one operator) |
-
-### Sample trace
-
-```
-=== trace: traces/2026-05-21T190410Z_a91a290b.jsonl ===
-  [2026-05-21T19:04:10Z] user_query: 'Which three users had the most admin actions this week?'
-
-  --- iteration 1 ---
-    model_call    model=qwen2.5-coder-7b-instruct-mlx  messages=2  latency_ms=3111
-    tool_call     summary_stats(group_by='user')  latency_ms=2
-    tool_result   summary_stats → {"group_by": "user", "total_events": 10, "buckets": [{"key": "8bcc65a8fac92c0f", "count": 10}], ...}
-
-  --- iteration 2 ---
-    model_call    model=qwen2.5-coder-7b-instruct-mlx  messages=4  latency_ms=3436
-
-  === final_answer  iterations=2  total_latency_ms=6551 ===
-  Based on the provided summary statistics, there was only one user
-  (identified by the hash prefix `8bcc65a8fac92c0f`) who had any
-  admin actions during the specified time range. ...
-
-  summary: 2 model calls (6547 ms), 1 tool calls (2 ms)
-```
-
-### Tampering smoke test
-
-The point of an HMAC-chained log is that any modification produces
-a detectable break. To prove the agent surfaces it correctly, we
-copy the live log to a temp directory, mutate one field
-(`matter_code`) inside the third entry of an archive, and re-run
-Q2 against the tampered copy:
-
-```bash
-# 1. Copy logs/audit.log + rotations to /tmp/sitting2-tamper.XXXX/
-# 2. Mutate one entry's matter_code field inside the gz archive
-# 3. Re-run query 2 against the copy
-LOCALLYAI_AUDIT_LOG=/tmp/sitting2-tamper.XXXX/audit.log python cli.py
-```
-
-Real terminal output from the smoke test:
-
-```
-[Agent] Iteration 1
-[Agent] Tool call: hmac_verify(end_seq=1000)
-[Tool ] hmac_verify → chain BROKEN  verified=9/10  first_failure_seq=5
-  - seq=5  ts=2026-05-15T16:08:17Z  stored=ab4aa6460d6c…  expected=00a6dbcdd2a2…
-
-[Agent] Iteration 2
-
-[Agent] Final answer (iter=2):
-The audit log chain for the last 10 entries is not intact. The first
-failure is at entry sequence number 5, which has an HMAC mismatch.
-The expected HMAC for this entry is 00a6dbcdd2a2c0a5...010f5a5, but
-the stored HMAC is ab4aa6460d6cdebb...869e24403b. The failure occurred
-at timestamp 2026-05-15T16:08:17Z.
-```
-
-This is the demo moment: the chain is cryptographically verifiable
-**by anyone holding `LOCALLYAI_AUDIT_HMAC_KEY`**, with no external
-service required. The forensic agent reasons about both the
-content of what happened *and* whether the log of what happened
-has been altered since.
-
-### Secret-key handling discipline
-
-`LOCALLYAI_AUDIT_HMAC_KEY` is loaded from the environment by
-`tools._load_hmac_key()`. **It is never accepted as a tool
-argument** — the model is not in the loop on secrets, by design.
-If the env var is unset, `hmac_verify` raises `HmacKeyMissing`
-with a clear message rather than silently returning `chain_intact=False`.
-
-## Audit log format (read from LocallyAI source)
-
-LocallyAI writes JSONL to `logs/audit.log` with daily rotation
-into `logs/audit-YYYY-MM-DD.log.gz`. Each entry is one JSON
-object on one line. The schema (12 fields + `_chain_hmac`):
-
-| Field | Notes |
-|---|---|
-| `timestamp` | ISO 8601 UTC, e.g. `2026-05-14T21:23:08Z` |
-| `node_id` | hostname of the writing node |
-| `data_region` | `UK` or `KSA` |
-| `user_hash` | SHA-256 of (salt + username), 16-hex-char pseudonym (GDPR Art. 25) |
-| `salt_era` | which `LOCALLYAI_AUDIT_SALT_ERA_N` produced `user_hash` |
-| `model` | model ID for chat events; `-` for non-chat events |
-| `sources` | number of retrieval sources used (0 for non-chat) |
-| `latency_ms` | wall time of the action |
-| `backend` | `mlx`, `ollama`, `lmstudio` |
-| `query_hash` | SHA-256 of the query text (queries themselves are NEVER logged) |
-| `matter_code` | client/matter identifier (free-text, may be empty) |
-| `_chain_hmac` | HMAC-SHA256 over (prev_hmac \|\| canonical_json(entry)) — verifier checks this in sitting 2 |
-
-Pseudonymisation note for the forensic agent: a question like
-*"find admin events"* cannot literal-string-match a username —
-the audit log carries hashes only. A well-designed agent answers
-*"the log is pseudonymised by design; here are events in the
-relevant time range / matching the relevant model field"*.
-
-## Dependencies
-
-```
-openai     (Python client — talks to Ollama/LM Studio via OpenAI-compatible API)
-pydantic   (kept for v2 schemas in later sittings)
-pyyaml     (sitting 4 — eval/dataset.yaml)
-anthropic  (sitting 4 — Claude judge, DEV-ONLY, see "Eval suite" below)
-```
-
-Install:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install openai pydantic pyyaml anthropic
-```
-
-## Run
-
-```bash
-# default — points at logs/audit.log of the sibling LocallyAI checkout
-python cli.py
-
-# point at a specific log file or gzipped archive
-LOCALLYAI_AUDIT_LOG=/path/to/audit-2026-05-16.log.gz python cli.py
-
-# point at a different OpenAI-compatible endpoint
-BASE_URL=https://office-mac.local:8000/v1 python cli.py
-```
-
-`cli.py` ships one hardcoded test query and prints each tool call,
-each tool result, and the final answer.
+---
 
 ## Eval suite
 
-Sitting 4 added a 30-question eval suite over the four-tool agent.
-Every change to the agent (prompt, model, tool description, fixture)
-is now measurable rather than vibes-graded.
-
-### Dataset
-
-[`eval/dataset.yaml`](eval/dataset.yaml) — 30 questions distributed:
-
-| Category | Count | What it tests |
-|---|---|---|
-| `log_search` | 8 | keyword routing, pseudonymisation tripwires, hallucination guards |
-| `time_range` | 6 | precise ISO-8601 window filtering, event_type filter, ascending sort |
-| `aggregation` | 6 | all four `group_by` values (`user`, `event_type`, `hour_of_day`, `day`); top-N edge cases |
-| `integrity` | 5 | clean + tampered fixtures; range-scoped verify; citation precision |
-| `multi_tool` | 5 | 2+ tool sequences including the hardest "busiest day + chain integrity for that day" case on a tampered fixture |
-
-Each question carries `expected_tools`, ground-truth facts, required + forbidden substrings (hallucination guards), difficulty (easy/medium/hard), and `log_fixture` (clean or tampered). Ground truth is anchored to the **real** LocallyAI audit log on the developer machine — 10 entries, one pseudonymised user, 2 days, the chain intact on `clean` and broken at seq=5 on `tampered`.
-
-Fixtures live under `eval/fixtures/` (gitignored — they contain timestamped data from the live LocallyAI deployment). [`eval/fixtures.py`](eval/fixtures.py) rebuilds them idempotently from the live log; the tamper at seq=5 is deterministic so the eval is reproducible.
+30 questions; Claude as judge; markdown summary per run; diff tool
+for run-to-run comparison.
 
 ### Configuring the cloud judge
 
-> **Important.** The agent itself stays fully air-gapped at runtime. The eval **judge** is the **one place** in the codebase where the air-gap rule is relaxed: it calls Claude (`api.anthropic.com`) to grade the agent's answers against the dataset's ground-truth facts. This is **dev-only tooling** — the judge never ships into a regulated-industry deployment. The distinction is intentional and matters for the pitch: judging is a developer-side measurement activity, not part of the agent the firm runs.
-
-The judge calls Claude Haiku 4.5 by default (cheap, fast, sufficient for the structured boolean grading the prompt asks for). To use it:
+> **Important.** The agent runtime stays fully air-gapped. The
+> eval **judge** is the **one place** where the air-gap rule is
+> relaxed: it calls Claude at `api.anthropic.com` to grade the
+> agent's answers against the dataset's ground-truth facts. This
+> is **dev-only tooling** — the judge never ships into a
+> regulated-industry deployment. The judge **never sees the audit
+> log** — only the question, ground-truth facts, the agent's
+> answer, and the tools the agent called.
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-# Optional: switch to a stronger judge for closer calls
-export JUDGE_MODEL=claude-sonnet-4-6-20251022
+./run.sh eval                 # full run
+./run.sh eval-dry             # no judge, captures agent answers only
+./run.sh eval-resume eval/runs/<file>.jsonl   # resume an interrupted run
+./run.sh compare eval/runs/<a>.jsonl eval/runs/<b>.jsonl
 ```
 
-The judge **never sees the audit log** — it sees only the question, ground-truth facts, the agent's answer, and the tools the agent called. That separation is what keeps the eval deterministic across log changes.
+Output lands in `eval/runs/`:
 
-### Running the eval
+- `<stamp>.jsonl` — one line per question
+- `<stamp>_summary.md` — overall + per-category + per-difficulty pass rates, failed-question list with judge rationales
 
-```bash
-# full 30-question run (~10–15 min on Qwen 2.5 Coder 7B via LM Studio,
-# 20–40 min on Qwen 2.5 14B via Ollama)
-set -a; source /path/to/locallyai/.env; set +a       # LOCALLYAI_AUDIT_HMAC_KEY
-export BASE_URL=http://localhost:1234/v1
-export MODEL=qwen2.5-coder-7b-instruct-mlx
-export ANTHROPIC_API_KEY=sk-ant-...
-python -m eval.run
+### Dataset
 
-# or equivalently via the cli.py entry point
-python cli.py --eval
+`eval/dataset.yaml` — 30 questions across 5 categories
+(log_search/time_range/aggregation/integrity/multi_tool) and 3
+difficulty levels. Each has `expected_tools`, ground-truth facts,
+required + forbidden substrings (hallucination guards), and
+`log_fixture` (clean or tampered).
 
-# debug flags
-python -m eval.run --limit 5                         # first 5 questions only
-python -m eval.run --start-from q15 --resume-into eval/runs/<existing>.jsonl
-python -m eval.run --no-judge                        # offline dry-run (no Claude call)
-```
-
-Output lands in [`eval/runs/`](eval/runs/):
-
-- `<stamp>.jsonl` — one line per question (`id`, `category`, `tools_called`, `answer`, `judge:{tool_pass,answer_pass,rationale,…}`, `trace_path`, `agent_latency_ms`)
-- `<stamp>_summary.md` — overall + per-category + per-difficulty pass rates, failed-question list with judge rationales, total runtime, judge token usage + estimated cost
-
-### Comparing runs
-
-```bash
-python -m eval.compare eval/runs/<base>.jsonl eval/runs/<new>.jsonl
-```
-
-Surfaces (a) per-question status flips (pass → fail, fail → pass), (b) per-category pass-rate deltas, (c) overall per-axis deltas. This is the tool to reach for every time you tighten a prompt, swap a model, or refactor a tool description.
+The tampered fixture is built by `eval/fixtures.py` from the live
+LocallyAI audit log — `LOCALLYAI_AUDIT_LOG_SOURCE` controls which
+file it copies. Fixtures live under `eval/fixtures/` (gitignored).
 
 ### Baseline (2026-05-21)
 
-First baseline run committed at [`eval/runs/2026-05-21T192709Z.jsonl`](eval/runs/2026-05-21T192709Z.jsonl) + [`_summary.md`](eval/runs/2026-05-21T192709Z_summary.md). All 30 questions ran end-to-end against `qwen2.5-coder-7b-instruct-mlx` via LM Studio; runtime 5.6 min.
+First baseline run at `eval/runs/2026-05-21T192709Z.jsonl` +
+`_summary.md`. All 30 questions ran end-to-end against
+`qwen2.5-coder-7b-instruct-mlx` via LM Studio; runtime 5.6 min.
+**Anthropic credit ran out after question 8**, so 8/30 have valid
+grades and 22/30 are `judge_error=true`. The agent's answers are
+captured in the JSONL for all 30 — re-grading after a top-up is a
+no-extra-agent-cost run via `./run.sh eval-resume`.
 
-**The judge ran out of Anthropic credit after question 8.** 22 of 30 questions have valid grades; 22 have `judge_error=true` (the JSONL records the agent's answer + tool calls for every question, so re-grading after topping up is a no-cost run). Honest numbers from the validly-graded subset only:
+Honest numbers from the validly-graded subset:
 
 | Axis | Rate (graded only) |
 |---|---|
@@ -317,26 +261,282 @@ First baseline run committed at [`eval/runs/2026-05-21T192709Z.jsonl`](eval/runs
 | Answer correctness | 2 / 8 (25.0%) |
 | Both axes | 2 / 8 (25.0%) |
 
-By category (graded subset is `log_search` only — the credit ran out before any other category got judged):
+---
 
-| Category | Both pass | Tool pass | Answer pass |
-|---|---|---|---|
-| `log_search` | 2/8 (25.0%) | 7/8 (87.5%) | 2/8 (25.0%) |
-| `time_range` | — (no graded rows) | — | — |
-| `aggregation` | — (no graded rows) | — | — |
-| `integrity` | — (no graded rows) | — | — |
-| `multi_tool` | — (no graded rows) | — | — |
+## Troubleshooting
 
-**Honest read:** the agent reliably picks the right tool on simple content questions (7/8 tool-pass) but the model hallucinates content on questions where the answer requires reading the search results carefully (e.g. q02 — the agent searched for `"MLX"`, got 0 hits because the model field is `"mlx-community/..."` lowercased, and then **confabulated** "no entries used the MLX backend" instead of broadening the search). This is exactly the kind of failure mode the eval is meant to expose.
+Organised by symptom. If you don't see your symptom, run
+`./run.sh doctor` — it surfaces 90% of issues with a clear fix
+suggestion.
 
-**Next-session task:** top up the Anthropic balance, re-grade the remaining 22 questions with `python -m eval.run --start-from q09 --resume-into eval/runs/2026-05-21T192709Z.jsonl`, then begin the prompt + tool-description tuning loop in sitting 5 with `python -m eval.compare` reporting deltas against this baseline.
+### Setup
 
-### Honest limits
+#### `bash: ./run.sh: Permission denied`
+`run.sh` lost its executable bit. Fix: `chmod +x ./run.sh`.
 
-- One judge (Claude Haiku 4.5). No model-vs-model judge matrices.
-- 30 questions, not 100. Quality of questions over count for v1.
-- Markdown summary; no HTML dashboard, no charts.
-- The dataset's ground truth is currently anchored to a 10-entry log on the developer machine. Re-generating the fixtures against a richer log requires updating `ground_truth_facts` in `dataset.yaml` for any quantitative claim that depends on counts.
+#### `python3: command not found`
+You're on a system without Python 3. Fix on macOS:
+`brew install python@3.12`. After install, verify with
+`python3 -V` — needs 3.10 or newer.
+
+#### `./run.sh setup` fails on pip install
+Three common causes:
+1. **Offline / proxy.** Set `HTTPS_PROXY` env if your network needs one.
+2. **PyPI index unreachable.** Try `pip install -i https://pypi.org/simple openai` as a sanity check.
+3. **Wrong venv.** If you have a global pip alias, your installs may land outside `.venv/`. After `./run.sh setup`, confirm with `./run.sh doctor` — the deps check looks inside `.venv/`.
+
+#### `venv missing at .../venv. Run: ./run.sh setup`
+You skipped setup. Run `./run.sh setup` exactly once.
+
+#### `ModuleNotFoundError: No module named 'openai'` (or `yaml`, `anthropic`, `pydantic`)
+The venv exists but a dep is missing. Re-run `./run.sh setup` —
+it's idempotent and only installs what's missing.
+
+### LM Studio / model backend
+
+#### `LM Studio (or whatever's serving http://localhost:1234/v1) is unreachable`
+Walk down the checklist `run.sh` prints:
+1. **LM Studio open?** Check the macOS Dock.
+2. **Developer tab → Status: Running?** Default toggle is OFF on a fresh launch — you have to flip it.
+3. **Model loaded?** The dropdown at the top of the Developer pane must show a chat-capable model. An embedding-only model won't serve `/v1/chat/completions`.
+4. **Port collision?** Something else might be on 1234. `lsof -nP -iTCP:1234 -sTCP:LISTEN` shows the culprit. Either kill it or change LM Studio's port and override with `BASE_URL=http://localhost:<port>/v1 ./run.sh demo`.
+
+#### `Model 'qwen2.5-coder-7b-instruct-mlx' is NOT in the loaded model list`
+Either load that model in LM Studio (Developer → top dropdown), or
+override the agent's expected model name to match what's loaded:
+```bash
+MODEL=$(curl -sS http://localhost:1234/v1/models | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])') ./run.sh demo
+```
+
+#### Agent gets `400 ... messages: array too long` or `context length exceeded`
+The conversation grew past the model's context window. Most often
+during eval on questions that chain several tools. Mitigation
+already in place: tool results are truncated to 1500 chars going
+back into the messages array. If you still hit this on a question
+that needs huge results, narrow the question or use a model with a
+bigger context window.
+
+#### Agent gets `llama runner process has terminated` (Ollama specifically)
+Known Ollama issue on certain macOS / Metal version combinations —
+the runner can't compile a Metal shader. **The agent's not at fault.**
+Two fixes:
+1. **Upgrade Ollama:** `brew install --cask ollama-app --force` (will replace `/Applications/Ollama.app`; quit Ollama first).
+2. **Switch to LM Studio** for the same model. The LocallyAI install docs walk through this.
+
+#### Model responds in seconds but tool args are nonsense
+e.g. `hmac_verify(end_seq='<insert_last_sequence_number>')`. The
+model is hallucinating placeholder syntax. Two retries usually
+self-correct (the dispatch returns a tool error → model adjusts).
+If the model gets stuck for more than 5 iterations, the agent's
+hard cap kicks in and the final answer is prefixed with `[agent:
+hit MAX_ITERATIONS=5 without settling]`. Swap to a stronger model
+or tighten the system prompt for that question shape.
+
+#### Model picks the wrong tool
+Tool descriptions in `tools.py` carry the routing weight (the
+system prompt is intentionally brief). The fix is to tighten the
+specific tool's description, then re-run the eval and use
+`./run.sh compare` to verify the change didn't regress other
+questions.
+
+### LocallyAI deployment / env
+
+#### `LOCALLYAI_AUDIT_HMAC_KEY not set` / `HmacKeyMissing`
+The agent couldn't find LocallyAI's `.env`. Three fixes:
+1. **Standard location:** make sure `~/locallyai/.env` exists and has `LOCALLYAI_AUDIT_HMAC_KEY=...`. `run.sh` auto-sources it.
+2. **Custom location:** `LOCALLYAI_ENV=/path/to/.env ./run.sh demo`.
+3. **No LocallyAI install at all:** export the key directly: `export LOCALLYAI_AUDIT_HMAC_KEY=$(python3 -c 'import secrets; print(secrets.token_hex(32))')`. **Warning:** if you do this against an existing log, every `hmac_verify` will report `chain_intact=false` — the chain was written with a different key.
+
+#### `LOCALLYAI_AUDIT_LOG=... does not exist`
+LocallyAI hasn't been installed at `~/locallyai`, or it has but no
+audit entries have been written yet, or it's at a custom path.
+Fix one of:
+- `LOCALLYAI_REPO=/path/to/locallyai ./run.sh demo`
+- `LOCALLYAI_AUDIT_LOG=/explicit/path.log ./run.sh demo`
+- Generate at least one audit entry: send any chat request to LocallyAI's `/v1/chat/completions` with admin auth.
+
+#### Active log is empty (0 bytes) but doctor says it's fine
+This is normal — LocallyAI rotates `logs/audit.log` to
+`logs/audit-YYYY-MM-DD.log.gz` at midnight. The walker reads
+both the active log AND sibling `.gz` rotations. As long as
+`./run.sh doctor` shows ≥1 rotation, you have content.
+
+#### Every `hmac_verify` returns `chain_intact=false, first_failure_seq=1`
+The HMAC key the agent has doesn't match the one LocallyAI used.
+Check that you're sourcing the right `.env`:
+```bash
+grep ^LOCALLYAI_AUDIT_HMAC_KEY ~/locallyai/.env
+```
+If LocallyAI ran a salt rotation, the *new* salt may be in
+`LOCALLYAI_AUDIT_HMAC_KEY` but old entries were signed with a
+prior era. Check LocallyAI's `LOCALLYAI_AUDIT_SALT_ERA_*` lines
+and document which era you want to verify against (`tools.py`
+currently uses the active key only — re-implementing era handling
+is on the backlog).
+
+#### `Permission denied: logs/audit.log`
+Macs running LocallyAI under launchd often chmod the log dir to
+`0700` for the install user. Read-only access requires either
+running the agent as the same user, or copying the logs to a
+location your user can read: `cp -R ~/locallyai/logs /tmp/audit-snapshot/ && LOCALLYAI_AUDIT_LOG=/tmp/audit-snapshot/audit.log ./run.sh demo`.
+
+### Agent runtime
+
+#### Agent prints `[Agent] Iteration 5 ... hit MAX_ITERATIONS=5 without settling`
+The model never produced a no-tool-calls response within 5 turns.
+Causes:
+- The model keeps calling tools with bad args and not learning.
+- The question really does need more iterations (genuinely complex).
+- A tool keeps returning errors and the model keeps retrying.
+
+Quickest debug: pretty-print the trace (`./run.sh trace`) and see
+where the loop went wrong. The 5-cap is conservative; if you have
+a question that legitimately needs more, edit `MAX_ITERATIONS` in
+`agent.py` — but most legitimate questions settle in 2–3.
+
+#### Trace file isn't being written
+1. `traces/` doesn't exist: `mkdir traces`
+2. Disk full: `df -h .`
+3. Permission denied on `traces/`: `chmod u+w traces/`
+4. `LOCALLYAI_TRACE_DIR` was set to an unwritable path.
+
+#### `OSError: [Errno 24] Too many open files`
+A long eval run can hit the file-descriptor limit if previous
+runs left orphan tracer file handles. Restart your shell or
+`ulimit -n 4096`.
+
+### Eval — judge
+
+#### `JudgeNotConfigured: ANTHROPIC_API_KEY not set`
+Export the key before `./run.sh eval`:
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+./run.sh eval
+```
+Or run without the judge: `./run.sh eval-dry`.
+
+#### `BadRequestError ... Your credit balance is too low`
+This is what happened in the baseline run. The judge errors are
+not silently auto-failed — they're recorded as `judge_error=true`
+with `tool_pass=null` / `answer_pass=null`, so the summary's
+headline pass rate is computed only over the validly-graded
+subset.
+
+Recovery:
+1. Top up at https://console.anthropic.com/settings/billing
+2. `./run.sh eval-resume eval/runs/<that-jsonl>.jsonl`
+3. The runner auto-detects the first ungraded question and only re-grades the remainder. Agent answers are not re-run.
+
+#### Judge returns garbage / non-JSON
+The judge tolerates a stray ```json fence and tries to extract the
+first `{...}` from the response. If parsing fails entirely, the
+question is recorded as failed with `rationale: "judge output
+unparseable: ..."`. If this happens repeatedly:
+1. Try a stronger judge: `JUDGE_MODEL=claude-sonnet-4-6-20251022 ./run.sh eval`
+2. Inspect the JSONL — the failing rationale will quote the model's actual response.
+
+#### `RateLimitError 429`
+You're hitting Anthropic's per-minute rate limit. The eval runs
+sequentially with no built-in throttle. Wait 60 s, then
+`./run.sh eval-resume eval/runs/<file>.jsonl`. If this becomes
+chronic, add a `time.sleep(2)` between judge calls in `eval/run.py`.
+
+#### `AuthenticationError 401`
+The `ANTHROPIC_API_KEY` is wrong (typo, expired, revoked, or you
+copy-pasted with surrounding whitespace). Regenerate at the
+Anthropic console.
+
+### Eval — dataset / fixtures
+
+#### `nothing to run` after `--start-from <id>`
+Either the id is wrong (typo — they're `q01`..`q30`) or every
+question with id >= that value has already been graded. Check
+the JSONL: `python3 -c "import json; print([r['id'] for line in
+open('eval/runs/<file>.jsonl') for r in [json.loads(line)] if
+r['judge'].get('judge_error') or r['judge'].get('tool_pass') is
+None])"`.
+
+#### `KeyError: 'expected_tools'` or schema validation in dataset
+Someone edited `dataset.yaml` and broke the per-question required
+fields. The validator at the top of the dataset comment lists the
+exact set: `id`, `category`, `question`, `expected_tools`,
+`expected_answer_contains`, `expected_answer_excludes`,
+`ground_truth_facts`, `difficulty`, `log_fixture`, `notes`.
+
+#### Tampered fixture isn't broken (chain_intact=true)
+The tamper is keyed off a specific seq number (default 5). If
+the source LocallyAI log has fewer than 5 entries, the fixture
+builder raises `RuntimeError: tamper target seq=5 not found`.
+Either:
+- Wait until LocallyAI accumulates more entries.
+- Lower `TAMPER_TARGET_SEQ` in `eval/fixtures.py` to a seq that exists.
+
+#### Eval pass rate suddenly drops to 0 across the board
+Two prime suspects:
+1. **LM Studio crashed mid-run** — every question gets a model error → tool-call-less answer. Restart LM Studio and re-run.
+2. **Live LocallyAI log changed** — fixtures rebuilt with new entries that don't match the dataset's ground-truth facts. Either revert the change or update the dataset's `ground_truth_facts` to reflect the new reality.
+
+#### Fixture build crashes with `unreadable archive`
+The `.gz` files under `logs/.archived-pre-demo-reset/` aren't
+walked by the fixture builder, but if a top-level `.gz` is corrupt
+the builder errors out. Check with
+`gunzip -t logs/audit-*.log.gz`.
+
+### Comparison
+
+#### `compare` output shows huge regressions that don't make sense
+Most likely cause: the two runs used **different datasets** or
+different LocallyAI log content. The comparator joins rows by
+question `id`. If the dataset was edited between runs, two `q05`s
+may have completely different ground truth.
+
+Sanity check: were both runs from the same git commit?
+```bash
+git log --oneline eval/dataset.yaml | head -3
+```
+
+#### `ungraded on one side: base=N, new=M — skipped from rate deltas`
+The comparator correctly filters rows that aren't validly graded
+on both sides. If you want a full picture, regrade the ungraded
+side first (`./run.sh eval-resume <file>`), then re-compare.
+
+### Model behaviour quirks observed in practice
+
+These are real failure modes from the committed baseline. None
+are bugs in the agent or tools — they're model-quality issues
+that the eval is meant to expose so they can be tuned against.
+
+| Symptom | Example | Fix direction |
+|---|---|---|
+| Model searches with wrong-case keyword, gets 0 hits, confabulates "no entries found" instead of broadening | q02 searched `"MLX"`, got 0 hits (field is lowercase `"mlx-..."`), concluded no MLX entries | Tighten `log_search` description to mention case-insensitive matching; or add a system-prompt hint to retry with broader query on 0 hits |
+| Model resolves "yesterday" to its training cutoff date, not actual yesterday | q04 with `start='2023-10-14T...'` | Inject current date in system prompt, or add a `today()` micro-tool |
+| Model passes literal placeholder string as tool arg | `hmac_verify(end_seq='<insert_last_sequence_number>')` | Self-corrects on retry; if persistent, add an example invocation in the tool description |
+| Model routes content question to `time_range_query` when the question carries both a content cue and a time window | q01 "admin events from the last 24 hours" → either tool is reasonable | Accept both routings in the dataset, or tighten one description to disambiguate |
+
+The fix-and-measure loop for all of these:
+1. Make the change.
+2. `./run.sh eval-resume` (or full `./run.sh eval`).
+3. `./run.sh compare eval/runs/2026-05-21T192709Z.jsonl eval/runs/<new>.jsonl`.
+4. Check that the targeted question flipped fail → pass AND no other question flipped pass → fail.
+
+### Operating system / disk
+
+#### `OSError: [Errno 28] No space left on device`
+The trace dir filled the disk (each trace is ~1 KB; would need
+thousands for this). Clean: `rm -rf traces/*` (they're disposable
+— the live audit log is the source of truth).
+
+#### Eval run takes 3× longer than the README claims
+- **Cold model load:** first call after starting LM Studio includes the model load (~10–30 s). Subsequent calls are fast.
+- **Other Mac workloads competing for RAM:** Qwen 14B is ~9 GB resident. If LocallyAI is also running MLX models, you may swap. Quit one of them.
+- **Network latency to Anthropic** for the judge: each call is ~1–2 s. Eval is sequential; 30 questions × 2 s ≈ 1 minute of judge time, plus agent latency.
+
+#### Agent silently exits with no output
+Likely a Python exception during a tool dispatch that the agent's
+`try/except` caught and serialised as a `tool_result` with
+`error` — but then the model produced an empty final answer. Read
+the trace file (`./run.sh trace`) — every model + tool event is
+logged, including any error.
 
 ---
 
@@ -346,7 +546,9 @@ By category (graded subset is `log_search` only — the credit ran out before an
 - ~~**Sitting 2** — `hmac_verify` + system-prompt tool-routing + tamper-detection smoke test.~~ ✓ shipped
 - ~~**Sitting 3** — `time_range_query`, `summary_stats`, per-run JSONL tracing + `trace_viewer.py`.~~ ✓ shipped
 - ~~**Sitting 4** — 30-question eval suite + Claude judge + run comparator + baseline.~~ ✓ shipped
-- **Sitting 5** — Prompt + tool-description tuning to lift the baseline. Use `eval/compare.py` to verify every change. Also: swap to Qwen 2.5 14B Instruct (or a stronger Coder variant) once a working build is available; quantify the model-quality delta against the baseline. FastAPI server + per-firm deployment as a `/admin/forensics/ask` endpoint behind `_admin_auth`.
+- **Sitting 5** — Prompt + tool-description tuning to lift the baseline. Use `./run.sh compare` to verify every change. Swap to Qwen 2.5 14B Instruct once a stable build is available; quantify the model-quality delta against the baseline. FastAPI server + per-firm deployment as a `/admin/forensics/ask` endpoint behind LocallyAI's `_admin_auth`.
+
+---
 
 ## Known drift risk
 
@@ -358,11 +560,31 @@ doesn't need the full LocallyAI dependency tree to install — but
 if LocallyAI changes the chain algorithm (different canonicalisation,
 different HMAC msg format, different genesis convention) the
 verifier will silently return false positives or negatives.
+
 Mitigation: re-run the tampering smoke test against the latest
 LocallyAI archive after any LocallyAI release that touches
 `api.py:_chain_hmac` or `api.py:_write_audit`. Sitting 5 will
 introduce a thin `locallyai_adapter.py` that imports the canonical
 functions when LocallyAI is installed in the same Python env.
+
+---
+
+## Dependencies
+
+Pure-Python, four packages, no native compile:
+
+```
+openai     — talks to LM Studio / Ollama / LocallyAI via OpenAI-compatible API
+pydantic   — typed schemas in later sittings
+pyyaml     — eval/dataset.yaml
+anthropic  — Claude judge (DEV-ONLY; see Eval suite cloud-judge disclosure)
+```
+
+Install via `./run.sh setup`. The judge dep ships in the same
+venv as the agent itself; it's only used when you actually run
+`./run.sh eval`.
+
+---
 
 ## License
 
