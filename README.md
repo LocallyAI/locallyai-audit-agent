@@ -51,11 +51,50 @@ If `doctor` reports anything red or yellow, jump to
 | **Python ≥ 3.10** | the agent + eval are pure Python | `python3 -V` |
 | **A LocallyAI checkout** with a populated audit log | the agent reads `logs/audit.log` from this path | `ls ~/locallyai/logs/audit*.log*` |
 | **LocallyAI's `.env`** with `LOCALLYAI_AUDIT_HMAC_KEY` | `hmac_verify` needs it | `grep AUDIT_HMAC_KEY ~/locallyai/.env` |
-| **LM Studio** (or Ollama) **with a tool-capable Qwen model loaded** | the agent's LLM backend | `curl -s http://localhost:1234/v1/models` |
+| **One tool-capable backend** — LM Studio **or** Ollama **or** `mlx_lm.server` — with a Qwen 2.5 model loaded | the agent's LLM | `./run.sh doctor` probes all three |
 | **`ANTHROPIC_API_KEY`** *(eval only)* | the Claude judge | `echo $ANTHROPIC_API_KEY` |
 
 `./run.sh doctor` checks all of these in one shot and prints what
 needs fixing.
+
+## Choosing a backend
+
+The agent talks to any OpenAI-compatible `/v1/chat/completions`
+endpoint that emits tool-calls for Qwen 2.5. Three backends are
+supported out of the box:
+
+| Backend | Default URL | Default model | Pick when |
+|---|---|---|---|
+| **`lmstudio`** | `http://localhost:1234/v1` | `qwen2.5-coder-7b-instruct-mlx` | You want a GUI to manage models. Spec baseline used this. |
+| **`ollama`** | `http://localhost:11434/v1` | `qwen2.5:14b` | You already use Ollama and have models pulled there. **Watch out** for the `llama runner process has terminated` Metal-shader bug on older Ollama builds (see Troubleshooting). |
+| **`mlx`** | `http://localhost:8765/v1` | `mlx-community/Qwen2.5-7B-Instruct-4bit` | You want the lightest possible backend: `mlx_lm.server` is one process, no GUI, MLX-native on Apple Silicon. Reuses LocallyAI's `mlx_lm.server` install if present. |
+
+### Auto-detection
+
+By default (`BACKEND=auto`) `run.sh` probes lmstudio → ollama → mlx
+in that order and uses the first responsive one. You can pin
+explicitly:
+
+```bash
+BACKEND=ollama ./run.sh demo
+BACKEND=mlx    ./run.sh eval
+BACKEND=lmstudio MODEL=qwen2.5-14b-instruct ./run.sh ask "..."
+```
+
+Explicit `BASE_URL` / `MODEL` always win over the backend's defaults
+— useful for remote backends:
+
+```bash
+BASE_URL=http://office-mac.local:11434/v1 MODEL=qwen2.5:14b ./run.sh eval
+```
+
+### Starting each backend
+
+**LM Studio** — open the app, Developer tab, toggle **Status: Running**.
+
+**Ollama** — `open -a Ollama` (or it auto-starts on login). Pull a model: `ollama pull qwen2.5:14b`. If `ollama --version` is older than 0.24, upgrade first: `brew install --cask ollama-app --force`.
+
+**MLX** (`mlx_lm.server`) — `./run.sh start-mlx` in a separate terminal. Uses LocallyAI's `mlx_lm.server` install if available; otherwise install with `pip install mlx-lm`. Custom model: `./run.sh start-mlx mlx-community/Qwen2.5-14B-Instruct-4bit`.
 
 ---
 
@@ -85,7 +124,8 @@ Re-run `./run.sh doctor` — every line should be green.
 
 | What | Command | Notes |
 |---|---|---|
-| Sanity-check everything | `./run.sh doctor` | Reads-only. Always safe. |
+| Sanity-check everything | `./run.sh doctor` | Reads-only. Probes all three backends. Always safe. |
+| Start MLX backend (separate terminal) | `./run.sh start-mlx [<model>]` | Foreground-runs `mlx_lm.server` on port 8765. Ctrl-C to stop. |
 | 5-query CLI demo | `./run.sh demo` | ~30 s. Prints tool calls + answers + trace paths. |
 | One ad-hoc question | `./run.sh ask "Is the chain intact?"` | Writes one trace to `traces/`. |
 | Full eval (30 questions) | `./run.sh eval` | Needs `ANTHROPIC_API_KEY`. ~10–15 min on Coder 7B. |
@@ -112,8 +152,10 @@ All env vars the agent and `run.sh` recognise.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `BASE_URL` | `http://localhost:1234/v1` | OpenAI-compatible endpoint (LM Studio, Ollama, LocallyAI). Must serve `/v1/chat/completions` with tool-call support. |
-| `MODEL` | `qwen2.5-coder-7b-instruct-mlx` | Model identifier the backend recognises. For Ollama use `qwen2.5:14b`. For LocallyAI use its current model ID (see `/v1/models`). |
+| `BACKEND` | `auto` | Backend selection: `auto` \| `lmstudio` \| `ollama` \| `mlx`. `auto` probes lmstudio → ollama → mlx and uses the first responsive one. |
+| `BASE_URL` | (per backend) | OpenAI-compatible endpoint. Overrides `BACKEND`'s default. Examples: `http://localhost:1234/v1` (lmstudio), `http://localhost:11434/v1` (ollama), `http://localhost:8765/v1` (mlx). |
+| `MODEL` | (per backend) | Model identifier. Defaults by backend: `qwen2.5-coder-7b-instruct-mlx` (lmstudio), `qwen2.5:14b` (ollama), `mlx-community/Qwen2.5-7B-Instruct-4bit` (mlx). |
+| `MLX_PORT` | `8765` | Port `./run.sh start-mlx` binds to. Change if 8765 is taken. Remember to update `BASE_URL` to match. |
 | `LOCALLYAI_REPO` | `$HOME/locallyai` | Where to find LocallyAI's `.env` + `logs/`. Override if your checkout lives elsewhere. |
 | `LOCALLYAI_ENV` | `$LOCALLYAI_REPO/.env` | Path to LocallyAI's `.env`. Auto-sourced by `run.sh`. |
 | `LOCALLYAI_AUDIT_LOG` | `$LOCALLYAI_REPO/logs/audit.log` | The active audit log. Walker also picks up sibling `audit-YYYY-MM-DD.log.gz` rotations automatically. |
@@ -292,14 +334,30 @@ You skipped setup. Run `./run.sh setup` exactly once.
 The venv exists but a dep is missing. Re-run `./run.sh setup` —
 it's idempotent and only installs what's missing.
 
-### LM Studio / model backend
+### Backend (LM Studio / Ollama / MLX)
 
-#### `LM Studio (or whatever's serving http://localhost:1234/v1) is unreachable`
-Walk down the checklist `run.sh` prints:
-1. **LM Studio open?** Check the macOS Dock.
-2. **Developer tab → Status: Running?** Default toggle is OFF on a fresh launch — you have to flip it.
-3. **Model loaded?** The dropdown at the top of the Developer pane must show a chat-capable model. An embedding-only model won't serve `/v1/chat/completions`.
-4. **Port collision?** Something else might be on 1234. `lsof -nP -iTCP:1234 -sTCP:LISTEN` shows the culprit. Either kill it or change LM Studio's port and override with `BASE_URL=http://localhost:<port>/v1 ./run.sh demo`.
+#### `BACKEND=<x> endpoint http://... is unreachable`
+`./run.sh doctor` probes all three; pick whichever is responsive
+and pin it: `BACKEND=ollama ./run.sh demo`. To switch to a
+specific backend, follow its setup checklist:
+
+**LM Studio**:
+1. LM Studio open? Check the macOS Dock.
+2. Developer tab → Status: Running? Default toggle is OFF on a fresh launch.
+3. Model loaded? The dropdown at the top of the Developer pane must show a chat-capable model. Embedding-only won't serve `/v1/chat/completions`.
+4. Port collision? `lsof -nP -iTCP:1234 -sTCP:LISTEN`.
+
+**Ollama**:
+1. App running? `open -a Ollama` (or `brew services restart ollama`).
+2. Model pulled? `ollama list` should show `qwen2.5:14b` or similar.
+3. Recent enough? `ollama --version` ≥ 0.24 avoids the Metal-shader crash. Fix: `brew install --cask ollama-app --force` (quit Ollama first).
+4. Port collision? `lsof -nP -iTCP:11434 -sTCP:LISTEN`.
+
+**MLX (`mlx_lm.server`)**:
+1. Server started? `./run.sh start-mlx` in another terminal.
+2. Model downloaded? First run downloads weights from HuggingFace; subsequent runs are cached at `~/.cache/huggingface/hub/`.
+3. `mlx_lm.server: command not found`? Activate LocallyAI's venv first (`source ~/locallyai/.venv/bin/activate`) — it ships `mlx-lm`. Or `pip install mlx-lm` into the agent's venv.
+4. Port collision? `lsof -nP -iTCP:8765 -sTCP:LISTEN`. Change with `MLX_PORT=8766 ./run.sh start-mlx` and `BASE_URL=http://localhost:8766/v1 ./run.sh demo`.
 
 #### `Model 'qwen2.5-coder-7b-instruct-mlx' is NOT in the loaded model list`
 Either load that model in LM Studio (Developer → top dropdown), or
@@ -319,9 +377,31 @@ bigger context window.
 #### Agent gets `llama runner process has terminated` (Ollama specifically)
 Known Ollama issue on certain macOS / Metal version combinations —
 the runner can't compile a Metal shader. **The agent's not at fault.**
-Two fixes:
+Three fixes:
 1. **Upgrade Ollama:** `brew install --cask ollama-app --force` (will replace `/Applications/Ollama.app`; quit Ollama first).
-2. **Switch to LM Studio** for the same model. The LocallyAI install docs walk through this.
+2. **Switch to LM Studio:** `BACKEND=lmstudio ./run.sh demo` after toggling LM Studio's server on.
+3. **Switch to MLX:** `./run.sh start-mlx` in one terminal, `BACKEND=mlx ./run.sh demo` in another. Same Qwen 2.5 family, no Ollama dependency.
+
+#### MLX backend: `mlx_lm.server not found`
+The agent's venv doesn't have `mlx-lm` installed (it's a heavy
+dep — PyTorch-equivalent + the model loader). Two fixes:
+1. **Reuse LocallyAI's install:** `./run.sh start-mlx` auto-detects `~/locallyai/.venv/bin/mlx_lm.server` if LocallyAI is installed. This is the recommended path.
+2. **Install into the agent's venv:** `source .venv/bin/activate && pip install mlx-lm`. Adds ~2 GB of deps.
+
+#### MLX backend: model fetch hangs on first start
+`mlx_lm.server` downloads the model from HuggingFace on first
+launch (~5 GB for Qwen 2.5 7B 4bit). Watch the output of `./run.sh
+start-mlx` — it shows `Fetching N files: ...`. Subsequent runs are
+cached. If the download stalls: `~/.cache/huggingface/hub/.locks/`
+may have orphan locks from a killed download; delete them and retry.
+
+#### MLX backend: tool-call response is `null` content + no `tool_calls`
+Qwen 2.5 + the bundled chat template supports tool-calling
+natively. If `mlx_lm.server` returns plain text instead of a
+`tool_calls` array, the model isn't applying the tool-call template.
+Two checks:
+1. **Model is Qwen 2.5 / 3 instruct?** Mistral / Llama 3.2 1B don't reliably emit OpenAI tool-call format.
+2. **`mlx-lm` version is recent?** `pip show mlx-lm | grep Version` — needs a version that handles `tools` in the request body. If stuck, upgrade: `pip install -U mlx-lm`.
 
 #### Model responds in seconds but tool args are nonsense
 e.g. `hmac_verify(end_seq='<insert_last_sequence_number>')`. The

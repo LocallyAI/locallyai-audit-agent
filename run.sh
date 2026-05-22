@@ -10,16 +10,30 @@
 #                           (auto-detects first ungraded question)
 #   compare <base> <new>    Diff two eval-run JSONL files
 #   trace [<file>]          Pretty-print a trace file (defaults to newest)
+#   start-mlx [<model>]     Foreground-run mlx_lm.server with a Qwen 2.5 MLX
+#                           model (default: mlx-community/Qwen2.5-7B-Instruct-4bit)
+#                           on port 8765. Stop with Ctrl-C.
 #   doctor                  Pre-flight every dependency + connection
 #   setup                   First-time: create venv + install deps + check tools
 #   help                    Print this usage
 #
+# Backends:
+#   BACKEND=auto    (default) — probe lmstudio → ollama → mlx in that order,
+#                                use the first responsive one
+#   BACKEND=lmstudio          — http://localhost:1234/v1  (LM Studio)
+#   BACKEND=ollama            — http://localhost:11434/v1 (Ollama)
+#   BACKEND=mlx               — http://localhost:8765/v1  (mlx_lm.server,
+#                                start with: ./run.sh start-mlx)
+#
+# When BACKEND is set (or auto-detected), sensible BASE_URL + MODEL
+# defaults are filled in. Explicit BASE_URL / MODEL overrides always
+# win. Examples:
+#   BACKEND=ollama ./run.sh demo
+#   MODEL=qwen2.5:14b BACKEND=ollama ./run.sh demo
+#   BASE_URL=http://office-mac.local:11434/v1 MODEL=qwen2.5:14b ./run.sh eval
+#
 # Every command auto-sources LocallyAI's .env if it exists at the
-# expected path, activates the venv, sets sensible defaults for
-# BASE_URL / MODEL / LOCALLYAI_AUDIT_LOG, then dispatches to Python.
-# Override any default by exporting before invocation:
-#   MODEL=qwen2.5:14b ./run.sh demo
-#   BASE_URL=http://office-mac.local:1234/v1 ./run.sh eval
+# expected path, activates the venv, then dispatches to Python.
 
 set -euo pipefail
 
@@ -44,10 +58,70 @@ cd "$HERE"
 LOCALLYAI_REPO="${LOCALLYAI_REPO:-$HOME/locallyai}"
 LOCALLYAI_ENV="${LOCALLYAI_ENV:-$LOCALLYAI_REPO/.env}"
 
-# ── defaults (override by exporting before invocation) ──────────────────
-: "${BASE_URL:=http://localhost:1234/v1}"
-: "${MODEL:=qwen2.5-coder-7b-instruct-mlx}"
+# ── backend selection + per-backend defaults ────────────────────────────
+# BACKEND env var: lmstudio | ollama | mlx | auto (default)
+# Per-backend defaults are applied ONLY if BASE_URL / MODEL aren't
+# already set in the environment. Explicit overrides always win.
+
+: "${BACKEND:=auto}"
 : "${LOCALLYAI_AUDIT_LOG:=$LOCALLYAI_REPO/logs/audit.log}"
+
+# Default port / model per backend. Tuned to what each tool ships:
+#   LM Studio: port 1234 by default, Qwen 2.5 Coder 7B MLX (our baseline model)
+#   Ollama:    port 11434 by default, Qwen 2.5 14B (Ollama publishes :14b as the instruct variant)
+#   mlx_lm.server: port 8765 by convention here, Qwen 2.5 7B Instruct 4bit (already on disk)
+LMSTUDIO_DEFAULT_URL="http://localhost:1234/v1"
+LMSTUDIO_DEFAULT_MODEL="qwen2.5-coder-7b-instruct-mlx"
+OLLAMA_DEFAULT_URL="http://localhost:11434/v1"
+OLLAMA_DEFAULT_MODEL="qwen2.5:14b"
+MLX_DEFAULT_URL="http://localhost:8765/v1"
+MLX_DEFAULT_MODEL="mlx-community/Qwen2.5-7B-Instruct-4bit"
+
+_probe() {  # _probe <base_url>  — returns 0 if /models is reachable
+    curl -sS -o /dev/null --max-time 2 "$1/models" 2>/dev/null
+}
+
+_apply_backend_defaults() {
+    case "$BACKEND" in
+        lmstudio)
+            : "${BASE_URL:=$LMSTUDIO_DEFAULT_URL}"
+            : "${MODEL:=$LMSTUDIO_DEFAULT_MODEL}"
+            ;;
+        ollama)
+            : "${BASE_URL:=$OLLAMA_DEFAULT_URL}"
+            : "${MODEL:=$OLLAMA_DEFAULT_MODEL}"
+            ;;
+        mlx)
+            : "${BASE_URL:=$MLX_DEFAULT_URL}"
+            : "${MODEL:=$MLX_DEFAULT_MODEL}"
+            ;;
+        auto)
+            # Probe in preference order. First responsive port wins.
+            # If the operator set BASE_URL explicitly, skip probing.
+            if [ -z "${BASE_URL:-}" ]; then
+                if   _probe "$LMSTUDIO_DEFAULT_URL"; then
+                    BACKEND=lmstudio; BASE_URL="$LMSTUDIO_DEFAULT_URL"; : "${MODEL:=$LMSTUDIO_DEFAULT_MODEL}"
+                elif _probe "$OLLAMA_DEFAULT_URL"; then
+                    BACKEND=ollama;   BASE_URL="$OLLAMA_DEFAULT_URL";   : "${MODEL:=$OLLAMA_DEFAULT_MODEL}"
+                elif _probe "$MLX_DEFAULT_URL"; then
+                    BACKEND=mlx;      BASE_URL="$MLX_DEFAULT_URL";      : "${MODEL:=$MLX_DEFAULT_MODEL}"
+                else
+                    # Nothing reachable. Fall back to LM Studio defaults
+                    # so the doctor / preflight steps fire a helpful error.
+                    BACKEND=lmstudio
+                    BASE_URL="$LMSTUDIO_DEFAULT_URL"
+                    : "${MODEL:=$LMSTUDIO_DEFAULT_MODEL}"
+                fi
+            else
+                : "${MODEL:=$LMSTUDIO_DEFAULT_MODEL}"
+            fi
+            ;;
+        *)
+            die "unknown BACKEND='$BACKEND'. Use lmstudio | ollama | mlx | auto."
+            ;;
+    esac
+    export BACKEND BASE_URL MODEL
+}
 
 # ── helpers ─────────────────────────────────────────────────────────────
 require_venv() {
@@ -79,29 +153,56 @@ check_python() {
     esac
 }
 
-check_lmstudio() {
+check_backend() {  # backend-aware probe; replaces the old check_backend
     if ! curl -sS -o /dev/null --max-time 3 "$BASE_URL/models" 2>/dev/null; then
-        err "LM Studio (or whatever's serving $BASE_URL) is unreachable."
+        err "BACKEND=$BACKEND endpoint $BASE_URL is unreachable."
+        case "$BACKEND" in
+            lmstudio)
+                cat >&2 <<EOF
+  Fix checklist for LM Studio:
+    1. LM Studio app is open                       (check Dock)
+    2. Developer tab → Status: Running             (toggle ON)
+    3. A chat-capable model is loaded               (Qwen 2.5 14B or Coder 7B)
+    4. Port 1234 not taken: lsof -nP -iTCP:1234 -sTCP:LISTEN
+EOF
+                ;;
+            ollama)
+                cat >&2 <<EOF
+  Fix checklist for Ollama:
+    1. Ollama app running: open -a Ollama   (or brew services restart ollama)
+    2. Ollama version is recent: ollama --version   (some older builds crash on
+       macOS Metal — symptom is "llama runner process has terminated").
+       Fix with: brew install --cask ollama-app --force
+    3. The model is pulled: ollama list   (expect qwen2.5:14b or similar)
+EOF
+                ;;
+            mlx)
+                cat >&2 <<EOF
+  Fix checklist for MLX (mlx_lm.server):
+    1. Start the server in another terminal:
+         $0 start-mlx                # uses default Qwen 2.5 7B 4bit
+         $0 start-mlx <model-id>     # specify a different MLX model
+    2. Confirm: curl http://localhost:8765/v1/models
+EOF
+                ;;
+        esac
         cat >&2 <<EOF
-  Symptoms checklist:
-    1. LM Studio app is open                     (check Dock)
-    2. Developer tab → Status: Running           (toggle ON)
-    3. A model is loaded in the dropdown          (Qwen 2.5 14B or Coder 7B)
-    4. Default port 1234 not taken by something else: lsof -nP -iTCP:1234
 
-  Override the URL with: BASE_URL=http://host:port/v1 $0 <subcommand>
+  Other options:
+    - Try auto-detect: BACKEND=auto $0 doctor
+    - Use a remote backend: BASE_URL=http://host:port/v1 $0 <subcommand>
 EOF
         return 1
     fi
-    # Confirm the requested model is actually loaded.
+    # Confirm the requested model is loaded.
     if ! curl -sS --max-time 3 "$BASE_URL/models" 2>/dev/null | python3 -c "
 import json,sys
 ids = [m['id'] for m in json.load(sys.stdin).get('data',[])]
 sys.exit(0 if '$MODEL' in ids else 1)
 " 2>/dev/null; then
-        warn "Model '$MODEL' is NOT in the loaded model list."
+        warn "Model '$MODEL' is NOT in the $BACKEND-loaded model list."
         warn "  Available: $(curl -sS --max-time 3 "$BASE_URL/models" | python3 -c 'import json,sys; print([m[\"id\"] for m in json.load(sys.stdin).get(\"data\",[])])' 2>/dev/null || echo '?')"
-        warn "  Either load '$MODEL' in LM Studio, or override: MODEL=<id> $0 <subcommand>"
+        warn "  Either load '$MODEL' in your backend, or override: MODEL=<id> $0 <subcommand>"
     fi
 }
 
@@ -222,20 +323,30 @@ cmd_doctor() {
         fail=1
     fi
     echo
-    echo "  ${C_BOLD}LM Studio (or compatible) at $BASE_URL${C_RESET}"
-    if curl -sS -o /dev/null --max-time 3 "$BASE_URL/models" 2>/dev/null; then
-        ok "  reachable"
-        local available; available=$(curl -sS --max-time 3 "$BASE_URL/models" | python3 -c 'import json,sys; print(",".join(m["id"] for m in json.load(sys.stdin).get("data",[])))' 2>/dev/null || echo "?")
-        echo "    loaded models: $available"
-        if echo "$available" | grep -q -- "$MODEL"; then
-            ok "    requested model '$MODEL' is loaded"
+    echo "  ${C_BOLD}backends — probing all three${C_RESET}"
+    local any_up=0
+    for entry in "lmstudio|$LMSTUDIO_DEFAULT_URL" "ollama|$OLLAMA_DEFAULT_URL" "mlx|$MLX_DEFAULT_URL"; do
+        local name="${entry%%|*}"; local url="${entry##*|}"
+        if curl -sS -o /dev/null --max-time 2 "$url/models" 2>/dev/null; then
+            local available; available=$(curl -sS --max-time 2 "$url/models" | python3 -c 'import json,sys; print(",".join(m["id"] for m in json.load(sys.stdin).get("data",[])))' 2>/dev/null || echo "?")
+            ok "  $name ($url) reachable; models: ${available:-<none>}"
+            any_up=1
         else
-            warn "    requested model '$MODEL' is NOT loaded"
+            warn "  $name ($url) unreachable"
         fi
-    else
-        err "  unreachable. Open LM Studio → Developer → Status: Running"
+    done
+    if [ "$any_up" -eq 0 ]; then
+        err "  no backend is reachable. Start one:"
+        echo "    LM Studio: open LM Studio → Developer → Status: Running" >&2
+        echo "    Ollama:    open -a Ollama   (and: brew install --cask ollama-app --force if old)" >&2
+        echo "    MLX:       $0 start-mlx" >&2
         fail=1
     fi
+    echo
+    echo "  ${C_BOLD}active selection (BACKEND=$BACKEND)${C_RESET}"
+    _apply_backend_defaults
+    log "  base_url: $BASE_URL"
+    log "  model:    $MODEL"
     echo
     echo "  ${C_BOLD}anthropic (for eval judge — optional)${C_RESET}"
     if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
@@ -256,7 +367,9 @@ cmd_doctor() {
 cmd_demo() {
     require_venv
     source_locallyai_env
-    check_lmstudio || die "fix the LM Studio issue above first"
+    _apply_backend_defaults
+    log "backend: $BACKEND  base_url: $BASE_URL  model: $MODEL"
+    check_backend || die "fix the backend issue above first"
     check_audit_log || die "fix the audit-log issue above first"
     check_hmac_key
     log "demo: running cli.py (5 queries)"
@@ -272,7 +385,9 @@ cmd_ask() {
     local q="$1"
     require_venv
     source_locallyai_env
-    check_lmstudio || die "fix the LM Studio issue above first"
+    _apply_backend_defaults
+    log "backend: $BACKEND  base_url: $BASE_URL  model: $MODEL"
+    check_backend || die "fix the backend issue above first"
     check_audit_log || die "fix the audit-log issue above first"
     check_hmac_key
     log "ask: $q"
@@ -284,7 +399,9 @@ cmd_ask() {
 cmd_eval() {
     require_venv
     source_locallyai_env
-    check_lmstudio || die "fix the LM Studio issue above first"
+    _apply_backend_defaults
+    log "backend: $BACKEND  base_url: $BASE_URL  model: $MODEL"
+    check_backend || die "fix the backend issue above first"
     check_audit_log || die "fix the audit-log issue above first"
     check_hmac_key
     check_anthropic_key || die "judge needs ANTHROPIC_API_KEY; or use: $0 eval-dry"
@@ -297,7 +414,9 @@ cmd_eval() {
 cmd_eval_dry() {
     require_venv
     source_locallyai_env
-    check_lmstudio || die "fix the LM Studio issue above first"
+    _apply_backend_defaults
+    log "backend: $BACKEND  base_url: $BASE_URL  model: $MODEL"
+    check_backend || die "fix the backend issue above first"
     check_audit_log || die "fix the audit-log issue above first"
     check_hmac_key
     log "eval-dry: 30-question run, judge SKIPPED (no Anthropic call)"
@@ -314,7 +433,9 @@ cmd_eval_resume() {
     [ -f "$target" ] || die "$target not found"
     require_venv
     source_locallyai_env
-    check_lmstudio || die "fix the LM Studio issue above first"
+    _apply_backend_defaults
+    log "backend: $BACKEND  base_url: $BASE_URL  model: $MODEL"
+    check_backend || die "fix the backend issue above first"
     check_audit_log || die "fix the audit-log issue above first"
     check_hmac_key
     check_anthropic_key || die "judge needs ANTHROPIC_API_KEY"
@@ -357,6 +478,45 @@ cmd_trace() {
     exec python trace_viewer.py "$target"
 }
 
+# ── subcommand: start-mlx ───────────────────────────────────────────────
+# Foreground-runs mlx_lm.server. Uses the LocallyAI venv's mlx_lm.server
+# binary if available (LocallyAI ships mlx-lm as a dep), otherwise the
+# system one. The port is 8765 to avoid collisions with LM Studio (1234),
+# Ollama (11434), and LocallyAI's own API (8000).
+#
+# Usage:
+#   ./run.sh start-mlx                              # default Qwen 7B 4bit
+#   ./run.sh start-mlx mlx-community/<other-model>  # custom
+#
+# Then in another terminal:  BACKEND=mlx ./run.sh demo
+cmd_start_mlx() {
+    local model="${1:-$MLX_DEFAULT_MODEL}"
+    local port="${MLX_PORT:-8765}"
+    local mlx_bin
+    if [ -x "$LOCALLYAI_REPO/.venv/bin/mlx_lm.server" ]; then
+        mlx_bin="$LOCALLYAI_REPO/.venv/bin/mlx_lm.server"
+        log "using LocallyAI venv's mlx_lm.server"
+    elif command -v mlx_lm.server >/dev/null 2>&1; then
+        mlx_bin="$(command -v mlx_lm.server)"
+        log "using system mlx_lm.server at $mlx_bin"
+    else
+        cat >&2 <<EOF
+$(err "mlx_lm.server not found.")
+  Install:
+    1. Easiest: source LocallyAI's venv — its mlx-lm install includes mlx_lm.server.
+       source $LOCALLYAI_REPO/.venv/bin/activate
+       $0 start-mlx
+    2. Otherwise install into a venv of your choice:
+       pip install mlx-lm
+       mlx_lm.server --model $MLX_DEFAULT_MODEL --port $port
+EOF
+        exit 1
+    fi
+    log "start-mlx: model=$model  port=$port  (Ctrl-C to stop)"
+    log "  in another terminal: BACKEND=mlx $0 demo"
+    exec "$mlx_bin" --model "$model" --host 127.0.0.1 --port "$port"
+}
+
 # ── dispatch ────────────────────────────────────────────────────────────
 main() {
     local sub="${1:-help}"
@@ -369,6 +529,7 @@ main() {
         eval-resume) cmd_eval_resume "$@" ;;
         compare)     cmd_compare "$@" ;;
         trace)       cmd_trace "$@" ;;
+        start-mlx)   cmd_start_mlx "$@" ;;
         doctor)      cmd_doctor ;;
         setup)       cmd_setup ;;
         help|-h|--help) usage ;;
