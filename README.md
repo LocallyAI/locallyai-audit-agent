@@ -1,5 +1,7 @@
 # locallyai-audit-agent
 
+[![CI](https://github.com/LocallyAI/locallyai-audit-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/LocallyAI/locallyai-audit-agent/actions/workflows/ci.yml)
+
 A forensic-investigation agent over LocallyAI's tamper-evident
 HMAC-chained audit log. The agent uses a local LLM (Qwen 2.5
 family) to interpret human questions and route them to four
