@@ -18,18 +18,23 @@
 #   help                    Print this usage
 #
 # Backends:
-#   BACKEND=auto    (default) — probe lmstudio → ollama → mlx in that order,
-#                                use the first responsive one
+#   BACKEND=mlx     (default) — http://localhost:8765/v1  (mlx_lm.server,
+#                                start with: ./run.sh start-mlx)
 #   BACKEND=lmstudio          — http://localhost:1234/v1  (LM Studio)
 #   BACKEND=ollama            — http://localhost:11434/v1 (Ollama)
-#   BACKEND=mlx               — http://localhost:8765/v1  (mlx_lm.server,
-#                                start with: ./run.sh start-mlx)
+#   BACKEND=auto              — probe lmstudio → ollama → mlx in that order,
+#                                use the first responsive one
 #
-# When BACKEND is set (or auto-detected), sensible BASE_URL + MODEL
-# defaults are filled in. Explicit BASE_URL / MODEL overrides always
-# win. Examples:
-#   BACKEND=ollama ./run.sh demo
-#   MODEL=qwen2.5:14b BACKEND=ollama ./run.sh demo
+# MLX is the default because it's the lightest path on Apple Silicon
+# (one process, MLX-native, reuses LocallyAI's mlx_lm.server install).
+# If MLX isn't running, the preflight prints the start-mlx command.
+#
+# When BACKEND is set, sensible BASE_URL + MODEL defaults are filled
+# in. Explicit BASE_URL / MODEL overrides always win. Examples:
+#   ./run.sh demo                                # uses MLX (default)
+#   BACKEND=lmstudio ./run.sh demo               # switch to LM Studio
+#   BACKEND=ollama   ./run.sh demo               # switch to Ollama
+#   BACKEND=auto     ./run.sh demo               # auto-detect
 #   BASE_URL=http://office-mac.local:11434/v1 MODEL=qwen2.5:14b ./run.sh eval
 #
 # Every command auto-sources LocallyAI's .env if it exists at the
@@ -63,7 +68,7 @@ LOCALLYAI_ENV="${LOCALLYAI_ENV:-$LOCALLYAI_REPO/.env}"
 # Per-backend defaults are applied ONLY if BASE_URL / MODEL aren't
 # already set in the environment. Explicit overrides always win.
 
-: "${BACKEND:=auto}"
+: "${BACKEND:=mlx}"
 : "${LOCALLYAI_AUDIT_LOG:=$LOCALLYAI_REPO/logs/audit.log}"
 
 # Default port / model per backend. Tuned to what each tool ships:

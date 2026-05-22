@@ -19,9 +19,15 @@ suite uses Claude as judge (cloud) but is dev-only tooling.
 git clone <this repo> ~/locallyai-audit-agent       # or you already have it
 cd ~/locallyai-audit-agent
 ./run.sh setup                                       # one-time
+./run.sh start-mlx                                   # in one terminal — starts mlx_lm.server (default backend)
+# in a second terminal:
 ./run.sh doctor                                      # pre-flight every dependency
 ./run.sh demo                                        # 5-query CLI demo
 ```
+
+The default backend is **MLX** (`mlx_lm.server`) because it's the
+lightest path on Apple Silicon. If you'd rather use LM Studio or
+Ollama: `BACKEND=lmstudio ./run.sh demo` (and skip `start-mlx`).
 
 If `doctor` reports anything red or yellow, jump to
 [**Troubleshooting**](#troubleshooting) below.
@@ -65,19 +71,20 @@ supported out of the box:
 
 | Backend | Default URL | Default model | Pick when |
 |---|---|---|---|
-| **`lmstudio`** | `http://localhost:1234/v1` | `qwen2.5-coder-7b-instruct-mlx` | You want a GUI to manage models. Spec baseline used this. |
+| **`mlx`** *(default)* | `http://localhost:8765/v1` | `mlx-community/Qwen2.5-7B-Instruct-4bit` | The lightest path: `mlx_lm.server` is one process, no GUI, MLX-native on Apple Silicon. Reuses LocallyAI's `mlx_lm.server` install if present. |
+| **`lmstudio`** | `http://localhost:1234/v1` | `qwen2.5-coder-7b-instruct-mlx` | You want a GUI to manage models. The committed sitting-4 baseline used this. |
 | **`ollama`** | `http://localhost:11434/v1` | `qwen2.5:14b` | You already use Ollama and have models pulled there. **Watch out** for the `llama runner process has terminated` Metal-shader bug on older Ollama builds (see Troubleshooting). |
-| **`mlx`** | `http://localhost:8765/v1` | `mlx-community/Qwen2.5-7B-Instruct-4bit` | You want the lightest possible backend: `mlx_lm.server` is one process, no GUI, MLX-native on Apple Silicon. Reuses LocallyAI's `mlx_lm.server` install if present. |
 
-### Auto-detection
+### Switching backends
 
-By default (`BACKEND=auto`) `run.sh` probes lmstudio → ollama → mlx
-in that order and uses the first responsive one. You can pin
-explicitly:
+The default is `BACKEND=mlx`. To switch:
 
 ```bash
-BACKEND=ollama ./run.sh demo
-BACKEND=mlx    ./run.sh eval
+BACKEND=lmstudio ./run.sh demo
+BACKEND=ollama   ./run.sh demo
+BACKEND=auto     ./run.sh demo               # auto-detect (probes
+                                             # lmstudio → ollama → mlx,
+                                             # picks first responsive)
 BACKEND=lmstudio MODEL=qwen2.5-14b-instruct ./run.sh ask "..."
 ```
 
@@ -152,7 +159,7 @@ All env vars the agent and `run.sh` recognise.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `BACKEND` | `auto` | Backend selection: `auto` \| `lmstudio` \| `ollama` \| `mlx`. `auto` probes lmstudio → ollama → mlx and uses the first responsive one. |
+| `BACKEND` | `mlx` | Backend selection: `mlx` (default) \| `lmstudio` \| `ollama` \| `auto`. `auto` probes lmstudio → ollama → mlx and uses the first responsive one. |
 | `BASE_URL` | (per backend) | OpenAI-compatible endpoint. Overrides `BACKEND`'s default. Examples: `http://localhost:1234/v1` (lmstudio), `http://localhost:11434/v1` (ollama), `http://localhost:8765/v1` (mlx). |
 | `MODEL` | (per backend) | Model identifier. Defaults by backend: `qwen2.5-coder-7b-instruct-mlx` (lmstudio), `qwen2.5:14b` (ollama), `mlx-community/Qwen2.5-7B-Instruct-4bit` (mlx). |
 | `MLX_PORT` | `8765` | Port `./run.sh start-mlx` binds to. Change if 8765 is taken. Remember to update `BASE_URL` to match. |
