@@ -251,6 +251,106 @@ def _emit_summary(
     summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+# ── --grade-only mode ──────────────────────────────────────────────────
+#
+# Re-judge ungraded rows in an existing JSONL in place. The agent is NOT
+# re-invoked — we trust the captured answer + tools_called from the
+# original run. This is the right shape for "the judge ran out of credit
+# mid-run; finish grading after a top-up" — re-running the agent against
+# a different model would mix models in one baseline.
+#
+# Rows with judge.judge_error == True OR judge.tool_pass is None are
+# considered "ungraded" and get re-judged. Rows that already have a
+# valid grade are skipped (idempotent: safe to re-run after a partial
+# regrade).
+
+def _grade_only(path_str: str) -> int:
+    from eval.judge import grade as judge_grade
+    p = Path(path_str)
+    if not p.exists():
+        print(f"[grade-only] file not found: {p}", file=sys.stderr)
+        return 1
+
+    # Validate judge up-front so a credit issue surfaces before any work.
+    try:
+        from eval.judge import _load_client
+        _load_client()
+    except JudgeNotConfigured as e:
+        print(f"\n[judge] {e}\n", file=sys.stderr)
+        return 2
+
+    with open(p, encoding="utf-8") as f:
+        rows = [json.loads(line) for line in f if line.strip()]
+
+    targets = [
+        i for i, r in enumerate(rows)
+        if (r.get("judge") or {}).get("judge_error")
+        or (r.get("judge") or {}).get("tool_pass") is None
+    ]
+    if not targets:
+        print(f"[grade-only] all {len(rows)} rows already have valid grades; nothing to do")
+        return 0
+
+    print(f"[grade-only] {p}")
+    print(f"[grade-only] re-judging {len(targets)} of {len(rows)} rows (skipping already-graded)")
+
+    t_start = time.perf_counter()
+    for n, i in enumerate(targets, start=1):
+        r = rows[i]
+        print(f"\n[{n}/{len(targets)}] {r['id']}  ({r['category']}/{r['difficulty']})")
+        try:
+            judge_out = judge_grade(
+                question=r["question"],
+                expected_tools=r["expected_tools"],
+                actual_tools=r.get("tools_called", []),
+                ground_truth_facts=r["ground_truth_facts"],
+                expected_answer_contains=r["expected_answer_contains"],
+                expected_answer_excludes=r["expected_answer_excludes"],
+                answer=r["answer"],
+            )
+            print(f"    judge: tool={judge_out['tool_pass']} answer={judge_out['answer_pass']}")
+        except Exception as exc:
+            judge_out = {
+                "tool_pass":   None,
+                "answer_pass": None,
+                "rationale":   f"judge unavailable: {type(exc).__name__}: {str(exc)[:200]}",
+                "judge_model": None,
+                "judge_error": True,
+            }
+            print(f"    judge: ERROR — {type(exc).__name__}: {exc}")
+        r["judge"] = judge_out
+
+    # Atomic rewrite: tmp file → rename. Avoids half-written JSONL on crash.
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+    tmp.replace(p)
+    duration_s = time.perf_counter() - t_start
+
+    # Regenerate the summary. Need fixture record for the header — load
+    # from the existing tampered fixture's marker; build_fixtures()
+    # returns it idempotently.
+    fixture_record = build_fixtures()
+    summary_path = p.with_name(p.stem + "_summary.md")
+    started_at = datetime.datetime.now(datetime.timezone.utc)
+    _emit_summary(
+        summary_path=summary_path,
+        results=rows,
+        started_at=started_at,
+        duration_s=duration_s,
+        fixture_record=fixture_record,
+        dataset_path=EVAL_DIR / "dataset.yaml",
+        model=os.environ.get("MODEL", "(from original run)"),
+        base_url=os.environ.get("BASE_URL", "(from original run)"),
+        judge_skipped=False,
+    )
+    print(f"\n[grade-only] complete. {duration_s:.1f}s total.")
+    print(f"[grade-only] JSONL:   {p}")
+    print(f"[grade-only] summary: {summary_path}")
+    return 0
+
+
 # ── Main ────────────────────────────────────────────────────────────────
 
 def main(argv: list[str] | None = None) -> int:
@@ -264,7 +364,17 @@ def main(argv: list[str] | None = None) -> int:
                     help="run only the first N questions (debug)")
     ap.add_argument("--no-judge", action="store_true",
                     help="skip the Claude judge (dry-run)")
+    ap.add_argument("--grade-only", default=None,
+                    help=("re-judge existing rows in this JSONL in place, "
+                          "without re-running the agent. Targets rows where "
+                          "judge.judge_error is true or tool_pass is None. "
+                          "Preserves the original agent answers + tool_calls. "
+                          "Use after topping up the judge's API budget."))
     args = ap.parse_args(argv)
+
+    # ── --grade-only branch — short-circuit before agent setup ──────────
+    if args.grade_only:
+        return _grade_only(args.grade_only)
 
     dataset_path = Path(args.dataset)
     with open(dataset_path, encoding="utf-8") as f:

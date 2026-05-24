@@ -7,7 +7,13 @@
 #   eval                    Run the full 30-question eval (needs ANTHROPIC_API_KEY)
 #   eval-dry                Run the eval without the Claude judge (offline)
 #   eval-resume <jsonl>     Resume an interrupted eval into an existing JSONL
-#                           (auto-detects first ungraded question)
+#                           (auto-detects first ungraded question; re-runs
+#                           the agent for those questions — use when the
+#                           agent answers themselves are missing)
+#   grade <jsonl>           Re-judge existing ungraded rows in place, without
+#                           re-running the agent. Use this when the judge
+#                           ran out of credit mid-run and you want to grade
+#                           the captured answers after a top-up. Idempotent.
 #   compare <base> <new>    Diff two eval-run JSONL files
 #   trace [<file>]          Pretty-print a trace file (defaults to newest)
 #   start-mlx [<model>]     Foreground-run mlx_lm.server with a Qwen 2.5 MLX
@@ -466,6 +472,21 @@ print(ids[0] if ids else '', end='')
     exec python -m eval.run --start-from "$first_ungraded" --resume-into "$target"
 }
 
+# ── subcommand: grade ──────────────────────────────────────────────────
+# Re-judge existing ungraded rows in place. NO backend needed (the agent
+# is not re-invoked), only ANTHROPIC_API_KEY.
+cmd_grade() {
+    if [ "$#" -lt 1 ]; then
+        die "usage: $0 grade <eval/runs/...jsonl>"
+    fi
+    local target="$1"
+    [ -f "$target" ] || die "$target not found"
+    require_venv
+    check_anthropic_key || die "judge needs ANTHROPIC_API_KEY"
+    log "grade: re-judging ungraded rows in $target (in place)"
+    exec python -m eval.run --grade-only "$target"
+}
+
 # ── subcommand: compare ─────────────────────────────────────────────────
 cmd_compare() {
     if [ "$#" -lt 2 ]; then
@@ -532,6 +553,7 @@ main() {
         eval)        cmd_eval "$@" ;;
         eval-dry)    cmd_eval_dry "$@" ;;
         eval-resume) cmd_eval_resume "$@" ;;
+        grade)       cmd_grade "$@" ;;
         compare)     cmd_compare "$@" ;;
         trace)       cmd_trace "$@" ;;
         start-mlx)   cmd_start_mlx "$@" ;;
