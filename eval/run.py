@@ -333,7 +333,7 @@ def _grade_only(path_str: str) -> int:
     # returns it idempotently.
     fixture_record = build_fixtures()
     summary_path = p.with_name(p.stem + "_summary.md")
-    started_at = datetime.datetime.now(datetime.timezone.utc)
+    started_at = datetime.datetime.now(datetime.UTC)
     _emit_summary(
         summary_path=summary_path,
         results=rows,
