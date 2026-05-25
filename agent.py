@@ -63,11 +63,53 @@ SYSTEM_PROMPT = (
     "  - hmac_verify      — chain integrity / tamper detection\n"
     "  - summary_stats    — counts and aggregations (group_by enum)\n"
     "Chain multiple tools if the question mixes shapes.\n\n"
+    # ── Keyword extraction (sitting-5 fix for log_search failures) ──
+    "CRITICAL: log_search treats `query` as a plain case-insensitive "
+    "substring over the raw JSON of each entry. Do NOT pass field "
+    "syntax like 'backend:mlx' or the whole user sentence. EXTRACT "
+    "the keyword and pass it bare. Examples:\n"
+    "  user: 'Which entries used the MLX inference backend?' "
+    "      → log_search(query='mlx')      ✓\n"
+    "      → log_search(query='backend:MLX')  ✗ (won't match the JSON)\n"
+    "      → log_search(query='MLX inference backend')  ✗ (too specific)\n"
+    "  user: 'Find UK entries.' → log_search(query='UK')  ✓\n"
+    "  user: 'Any Qwen models?'  → log_search(query='qwen')  ✓\n"
+    "If the first query returns zero results, try a SHORTER variant "
+    "(e.g. 'qwen' instead of 'Qwen2.5-7B') before concluding there "
+    "are none. Only conclude 'no results' after at least one retry.\n\n"
+    # ── Pseudonymisation explainer (sitting-5 fix for q04 / q07) ──
     "The log is pseudonymised by design: usernames live as SHA-256 "
-    "hashes in `user_hash`; query text is never stored, only its "
-    "SHA-256 in `query_hash`. There is no `event_type` column — "
-    "entries with model='-' are non-chat / admin actions, entries "
-    "with a real model string are chat completions.\n\n"
+    "hashes in `user_hash` (no plaintext names anywhere); query text "
+    "is never stored, only its SHA-256 in `query_hash` (so you cannot "
+    "search by what the user asked, only by hash if you have it). "
+    "When the user asks a question that requires plaintext that isn't "
+    "stored — e.g. 'who searched in Arabic?', 'find admin auth events' "
+    "by name, 'what did Alice ask?' — your answer MUST explicitly say "
+    "the relevant field (`user_hash` or `query_hash`) is pseudonymised "
+    "/ not stored, so the question cannot be answered from the audit "
+    "log alone. Use the literal words `user_hash` or `query_hash` and "
+    "`pseudonymised` (or `not stored`) in your answer.\n\n"
+    "There is no `event_type` column — entries with model='-' are "
+    "non-chat / admin actions; entries with a real model string are "
+    "chat completions.\n\n"
+    # ── Output discipline (sitting-5 fix for integrity / count failures) ──
+    "OUTPUT TEMPLATES:\n"
+    "  • hmac_verify result {chain_intact: true, verified_count: N, "
+    "total_count: N}:\n"
+    "      → 'Chain is intact. Verified N/N entries.' (use the literal "
+    "number; do NOT use the word `tamper` or `tampered` in the positive "
+    "case — say `intact`).\n"
+    "  • hmac_verify result {chain_intact: false, first_failure_seq: X, "
+    "failures: [...]}:\n"
+    "      → 'Chain BROKEN at sequence X (timestamp T). The affected "
+    "field is F.' — name the exact failing field from `failures[0]` "
+    "(e.g. `matter_code`).\n"
+    "  • log_search / time_range_query: report the EXACT count returned "
+    "by the tool. Say 'showing N entries' (the actual returned length); "
+    "if the tool capped the result, say so. Do NOT extrapolate to 'all'.\n"
+    "  • summary_stats: cite the top buckets with their counts. Match "
+    "the user's word choice (`top three`, `busiest`, etc) but do NOT "
+    "echo their phrasing if the rubric forbids it — paraphrase if uncertain.\n\n"
     "Cite entries by timestamp + `user_hash[:12]`. For integrity "
     "findings, cite `first_failure_seq` and the affected timestamp. "
     "For aggregations, cite the top buckets with their counts. "
@@ -80,10 +122,20 @@ SYSTEM_PROMPT = (
 # ── Loop ──────────────────────────────────────────────────────────────────
 
 def _make_client() -> OpenAI:
-    return OpenAI(
-        base_url=os.getenv("BASE_URL", DEFAULT_BASE_URL),
-        api_key="ollama",  # placeholder — Ollama ignores it
-    )
+    # Ollama ignores api_key; LocallyAI / LM Studio / mlx_lm.server check it.
+    # Honour OPENAI_API_KEY when set so the agent can run against a
+    # LocallyAI deployment (Bearer admin key).
+    #
+    # LOCALLYAI_INSECURE_TLS=1 → disable TLS verify (LocallyAI ships a
+    # self-signed cert; demos + dev runs use it without trusting CA).
+    kwargs: dict = {
+        "base_url": os.getenv("BASE_URL", DEFAULT_BASE_URL),
+        "api_key": os.getenv("OPENAI_API_KEY") or "ollama",
+    }
+    if os.getenv("LOCALLYAI_INSECURE_TLS") == "1":
+        import httpx
+        kwargs["http_client"] = httpx.Client(verify=False)
+    return OpenAI(**kwargs)
 
 
 def _dispatch(name: str, args_json: str, available: dict[str, Callable]) -> str:
